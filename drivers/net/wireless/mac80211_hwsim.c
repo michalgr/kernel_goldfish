@@ -770,7 +770,7 @@ static netdev_tx_t hwsim_mon_xmit(struct sk_buff *skb,
 
 static inline u64 mac80211_hwsim_get_tsf_raw(void)
 {
-	return ktime_to_us(ktime_get_real());
+	return ktime_to_us(ktime_get_boottime());
 }
 
 static __le64 __mac80211_hwsim_get_tsf(struct mac80211_hwsim_data *data)
