@@ -20,4 +20,16 @@ config GOLDFISH_PIPE
 	  This is a virtual device to drive the QEMU pipe interface used by
 	  the Goldfish Android Virtual Device.
 
+config GOLDFISH_FWDATA
+	tristate "Goldfish virtual device for Android-specific firmware data"
+	depends on ACPI
+	---help---
+	  This is a virtual device to parse Android-specific data (e.g. fstab
+	  configuration) stored in firmware (e.g. ACPI tables), and present it
+	  to userspace via sysfs. Currently, Android looks for some information
+	  in /proc/device-tree/firmware/android/, which does not exist on
+	  platforms that use ACPI instead of Device Tree, such as Goldfish
+	  (Ranchu) x86/x86_64. The driver for this device creates a directory in
+	  sysfs with the same layout.
+
 endif # GOLDFISH
