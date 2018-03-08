@@ -1,5 +1,4 @@
-/*
- * drivers/misc/goldfish_audio.c
+/* drivers/misc/goldfish_audio.c
  *
  * Copyright (C) 2007 Google, Inc.
  * Copyright (C) 2012 Intel, Inc.
@@ -27,7 +26,6 @@
 #include <linux/dma-mapping.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
-#include <linux/goldfish.h>
 #include <linux/acpi.h>
 #include <linux/goldfish.h>
 
@@ -58,10 +56,10 @@ struct goldfish_audio {
  *  Having two read buffers facilitate stereo -> mono conversion.
  *  Having two write buffers facilitate interleaved IO.
  */
-#define READ_BUFFER_SIZE        16384
-#define WRITE_BUFFER_SIZE       16384
-#define COMBINED_BUFFER_SIZE    ((2 * READ_BUFFER_SIZE) + \
-					(2 * WRITE_BUFFER_SIZE))
+#define READ_BUFFER_SIZE	16384
+#define WRITE_BUFFER_SIZE	16384
+#define COMBINED_BUFFER_SIZE	((2 * READ_BUFFER_SIZE) + \
+				 (2 * WRITE_BUFFER_SIZE))
 
 #define AUDIO_READ(data, addr)		(readl(data->reg_base + addr))
 #define AUDIO_WRITE(data, addr, x)	(writel(x, data->reg_base + addr))
@@ -129,8 +127,8 @@ static ssize_t goldfish_audio_read(struct file *fp, char __user *buf,
 		length = (count > READ_BUFFER_SIZE ? READ_BUFFER_SIZE : count);
 		AUDIO_WRITE(data, AUDIO_START_READ, length);
 
-		wait_event_interruptible(data->wait, data->buffer_status &
-					 AUDIO_INT_READ_BUFFER_FULL);
+		wait_event_interruptible(data->wait,
+			(data->buffer_status & AUDIO_INT_READ_BUFFER_FULL));
 
 		spin_lock_irqsave(&data->lock, irq_flags);
 		data->buffer_status &= ~AUDIO_INT_READ_BUFFER_FULL;
@@ -161,9 +159,9 @@ static ssize_t goldfish_audio_write(struct file *fp, const char __user *buf,
 		ssize_t copy = count;
 		if (copy > WRITE_BUFFER_SIZE)
 			copy = WRITE_BUFFER_SIZE;
-		wait_event_interruptible(data->wait, data->buffer_status &
+		wait_event_interruptible(data->wait, (data->buffer_status &
 					(AUDIO_INT_WRITE_BUFFER_1_EMPTY |
-					AUDIO_INT_WRITE_BUFFER_2_EMPTY));
+					AUDIO_INT_WRITE_BUFFER_2_EMPTY)));
 
 		if ((data->buffer_status & AUDIO_INT_WRITE_BUFFER_1_EMPTY) != 0)
 			kbuf = data->write_buffer1;
@@ -208,10 +206,10 @@ static int goldfish_audio_open(struct inode *ip, struct file *fp)
 					     AUDIO_INT_WRITE_BUFFER_2_EMPTY);
 		AUDIO_WRITE(audio_data, AUDIO_INT_ENABLE, AUDIO_INT_MASK);
 		return 0;
+	} else {
+		atomic_dec(&open_count);
+		return -EBUSY;
 	}
-
-	atomic_dec(&open_count);
-	return -EBUSY;
 }
 
 static int goldfish_audio_release(struct inode *ip, struct file *fp)
@@ -319,7 +317,7 @@ static int goldfish_audio_probe(struct platform_device *pdev)
 	data->read_buffer = data->buffer_virt + 2 * WRITE_BUFFER_SIZE;
 
 	ret = request_irq(data->irq, goldfish_audio_interrupt,
-					IRQF_SHARED, pdev->name, data);
+				IRQF_SHARED, pdev->name, data);
 	if (ret) {
 		dev_err(&pdev->dev, "request_irq failed\n");
 		goto err_request_irq_failed;
@@ -366,6 +364,7 @@ err_data_alloc_failed:
 static int goldfish_audio_remove(struct platform_device *pdev)
 {
 	struct goldfish_audio *data = platform_get_drvdata(pdev);
+
 	misc_deregister(&goldfish_audio_device);
 	free_irq(data->irq, data);
 	dma_free_coherent(&pdev->dev, COMBINED_BUFFER_SIZE,
