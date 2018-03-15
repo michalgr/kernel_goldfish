@@ -362,7 +362,7 @@ static int goldfish_fb_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id goldfish_fb_of_match[] = {
-	{ .compatible = "generic,goldfish-fb", },
+	{ .compatible = "google,goldfish-fb", },
 	{},
 };
 MODULE_DEVICE_TABLE(of, goldfish_fb_of_match);
@@ -378,7 +378,6 @@ static struct platform_driver goldfish_fb_driver = {
 	.remove		= goldfish_fb_remove,
 	.driver = {
 		.name = "goldfish_fb",
-		.owner = THIS_MODULE,
 		.of_match_table = goldfish_fb_of_match,
 		.acpi_match_table = ACPI_PTR(goldfish_fb_acpi_match),
 	}

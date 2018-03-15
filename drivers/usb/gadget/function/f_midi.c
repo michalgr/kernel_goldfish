@@ -361,7 +361,9 @@ static int f_midi_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 	/* allocate a bunch of read buffers and queue them all at once. */
 	for (i = 0; i < midi->qlen && err == 0; i++) {
 		struct usb_request *req =
-			midi_alloc_ep_req(midi->out_ep, midi->buflen);
+			midi_alloc_ep_req(midi->out_ep,
+				max_t(unsigned, midi->buflen,
+					bulk_out_desc.wMaxPacketSize));
 		if (req == NULL)
 			return -ENOMEM;
 
@@ -1140,6 +1142,7 @@ static void f_midi_free(struct usb_function *f)
 	for (i = opts->in_ports - 1; i >= 0; --i)
 		kfree(midi->in_port[i]);
 	kfree(midi);
+	opts->func_inst.f = NULL;
 	--opts->refcnt;
 	mutex_unlock(&opts->lock);
 }

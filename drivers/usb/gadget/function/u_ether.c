@@ -66,7 +66,7 @@ struct eth_dev {
 
 	spinlock_t		req_lock;	/* guard {rx,tx}_reqs */
 	struct list_head	tx_reqs, rx_reqs;
-	unsigned		tx_qlen;
+	atomic_t		tx_qlen;
 /* Minimum number of TX USB request queued to UDC */
 #define TX_REQ_THRESHOLD	5
 	int			no_tx_req_used;
@@ -568,6 +568,7 @@ static void tx_complete(struct usb_ep *ep, struct usb_request *req)
 		dev_kfree_skb_any(skb);
 	}
 
+	atomic_dec(&dev->tx_qlen);
 	if (netif_carrier_ok(dev->net))
 		netif_wake_queue(dev->net);
 }
@@ -741,19 +742,13 @@ static netdev_tx_t eth_start_xmit(struct sk_buff *skb,
 
 	req->length = length;
 
-	/* throttle highspeed IRQ rate back slightly */
-	if (gadget_is_dualspeed(dev->gadget) &&
-			 (dev->gadget->speed == USB_SPEED_HIGH)) {
-		dev->tx_qlen++;
-		if (dev->tx_qlen == (dev->qmult/2)) {
-			req->no_interrupt = 0;
-			dev->tx_qlen = 0;
-		} else {
-			req->no_interrupt = 1;
-		}
-	} else {
-		req->no_interrupt = 0;
-	}
+	/* throttle high/super speed IRQ rate back slightly */
+	if (gadget_is_dualspeed(dev->gadget))
+		req->no_interrupt = (((dev->gadget->speed == USB_SPEED_HIGH ||
+				       dev->gadget->speed == USB_SPEED_SUPER)) &&
+					!list_empty(&dev->tx_reqs))
+			? ((atomic_read(&dev->tx_qlen) % dev->qmult) != 0)
+			: 0;
 
 	retval = usb_ep_queue(in, req, GFP_ATOMIC);
 	switch (retval) {
@@ -762,6 +757,7 @@ static netdev_tx_t eth_start_xmit(struct sk_buff *skb,
 		break;
 	case 0:
 		net->trans_start = jiffies;
+		atomic_inc(&dev->tx_qlen);
 	}
 
 	if (retval) {
@@ -790,7 +786,7 @@ static void eth_start(struct eth_dev *dev, gfp_t gfp_flags)
 	rx_fill(dev, gfp_flags);
 
 	/* and open the tx floodgates */
-	dev->tx_qlen = 0;
+	atomic_set(&dev->tx_qlen, 0);
 	netif_wake_queue(dev->net);
 }
 
@@ -863,8 +859,6 @@ static int eth_stop(struct net_device *net)
 
 /*-------------------------------------------------------------------------*/
 
-static u8 host_ethaddr[ETH_ALEN];
-
 static int get_ether_addr(const char *str, u8 *dev_addr)
 {
 	if (str) {
@@ -893,17 +887,6 @@ static int get_ether_addr_str(u8 dev_addr[ETH_ALEN], char *str, int len)
 
 	snprintf(str, len, "%pM", dev_addr);
 	return 18;
-}
-
-static int get_host_ether_addr(u8 *str, u8 *dev_addr)
-{
-	memcpy(dev_addr, str, ETH_ALEN);
-	if (is_valid_ether_addr(dev_addr))
-		return 0;
-
-	random_ether_addr(dev_addr);
-	memcpy(str, dev_addr, ETH_ALEN);
-	return 1;
 }
 
 static const struct net_device_ops eth_netdev_ops = {
@@ -963,11 +946,9 @@ struct eth_dev *gether_setup_name(struct usb_gadget *g,
 	if (get_ether_addr(dev_addr, net->dev_addr))
 		dev_warn(&g->dev,
 			"using random %s ethernet address\n", "self");
-
-	if (get_host_ether_addr(host_ethaddr, dev->host_mac))
-		dev_warn(&g->dev, "using random %s ethernet address\n", "host");
-	else
-		dev_warn(&g->dev, "using previous %s ethernet address\n", "host");
+	if (get_ether_addr(host_addr, dev->host_mac))
+		dev_warn(&g->dev,
+			"using random %s ethernet address\n", "host");
 
 	if (ethaddr)
 		memcpy(ethaddr, dev->host_mac, ETH_ALEN);
@@ -1014,6 +995,7 @@ struct net_device *gether_setup_name_default(const char *netname)
 	spin_lock_init(&dev->lock);
 	spin_lock_init(&dev->req_lock);
 	INIT_WORK(&dev->work, eth_work);
+	INIT_WORK(&dev->rx_work, process_rx_w);
 	INIT_LIST_HEAD(&dev->tx_reqs);
 	INIT_LIST_HEAD(&dev->rx_reqs);
 

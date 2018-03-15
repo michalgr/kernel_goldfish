@@ -22,6 +22,7 @@
 
 #include "core.h"
 #include "bus.h"
+#include "host.h"
 #include "sd.h"
 #include "sdio_bus.h"
 #include "mmc_ops.h"
@@ -540,8 +541,8 @@ static int mmc_sdio_init_uhs_card(struct mmc_card *card)
 	 * SDR104 mode SD-cards. Note that tuning is mandatory for SDR104.
 	 */
 	if (!mmc_host_is_spi(card->host) &&
-	    ((card->sw_caps.sd3_bus_mode & SD_MODE_UHS_SDR50) ||
-	     (card->sw_caps.sd3_bus_mode & SD_MODE_UHS_SDR104)))
+	    ((card->host->ios.timing == MMC_TIMING_UHS_SDR50) ||
+	      (card->host->ios.timing == MMC_TIMING_UHS_SDR104)))
 		err = mmc_execute_tuning(card);
 out:
 	return err;
@@ -635,7 +636,7 @@ try_again:
 	 */
 	if (!powered_resume && (rocr & ocr & R4_18V_PRESENT)) {
 		err = mmc_set_signal_voltage(host, MMC_SIGNAL_VOLTAGE_180,
-					ocr);
+					ocr_card);
 		if (err == -EAGAIN) {
 			sdio_reset(host);
 			mmc_go_idle(host);
@@ -1227,6 +1228,8 @@ int sdio_reset_comm(struct mmc_card *card)
 
 	printk("%s():\n", __func__);
 	mmc_claim_host(host);
+
+	mmc_retune_disable(host);
 
 	mmc_go_idle(host);
 

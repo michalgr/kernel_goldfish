@@ -229,7 +229,7 @@ static int goldfish_battery_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id goldfish_battery_of_match[] = {
-	{ .compatible = "generic,goldfish-battery", },
+	{ .compatible = "google,goldfish-battery", },
 	{},
 };
 MODULE_DEVICE_TABLE(of, goldfish_battery_of_match);

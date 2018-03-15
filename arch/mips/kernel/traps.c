@@ -56,6 +56,7 @@
 #include <asm/pgtable.h>
 #include <asm/ptrace.h>
 #include <asm/sections.h>
+#include <asm/siginfo.h>
 #include <asm/tlbdebug.h>
 #include <asm/traps.h>
 #include <asm/uaccess.h>
@@ -144,7 +145,7 @@ static void show_backtrace(struct task_struct *task, const struct pt_regs *regs)
 	if (!task)
 		task = current;
 
-	if (raw_show_trace || !__kernel_text_address(pc)) {
+	if (raw_show_trace || user_mode(regs) || !__kernel_text_address(pc)) {
 		show_raw_backtrace(sp);
 		return;
 	}
@@ -194,6 +195,8 @@ void show_stack(struct task_struct *task, unsigned long *sp)
 {
 	struct pt_regs regs;
 	mm_segment_t old_fs = get_fs();
+
+	regs.cp0_status = KSU_KERNEL;
 	if (sp) {
 		regs.regs[29] = (unsigned long)sp;
 		regs.regs[31] = 0;
@@ -690,17 +693,43 @@ static int simulate_sync(struct pt_regs *regs, unsigned int opcode)
 asmlinkage void do_ov(struct pt_regs *regs)
 {
 	enum ctx_state prev_state;
-	siginfo_t info;
+	siginfo_t info = {
+		.si_signo = SIGFPE,
+		.si_code = FPE_INTOVF,
+		.si_addr = (void __user *)regs->cp0_epc,
+	};
 
 	prev_state = exception_enter();
 	die_if_kernel("Integer overflow", regs);
 
-	info.si_code = FPE_INTOVF;
-	info.si_signo = SIGFPE;
-	info.si_errno = 0;
-	info.si_addr = (void __user *) regs->cp0_epc;
 	force_sig_info(SIGFPE, &info, current);
 	exception_exit(prev_state);
+}
+
+/*
+ * Send SIGFPE according to FCSR Cause bits, which must have already
+ * been masked against Enable bits.  This is impotant as Inexact can
+ * happen together with Overflow or Underflow, and `ptrace' can set
+ * any bits.
+ */
+void force_fcr31_sig(unsigned long fcr31, void __user *fault_addr,
+		     struct task_struct *tsk)
+{
+	struct siginfo si = { .si_addr = fault_addr, .si_signo = SIGFPE };
+
+	if (fcr31 & FPU_CSR_INV_X)
+		si.si_code = FPE_FLTINV;
+	else if (fcr31 & FPU_CSR_DIV_X)
+		si.si_code = FPE_FLTDIV;
+	else if (fcr31 & FPU_CSR_OVF_X)
+		si.si_code = FPE_FLTOVF;
+	else if (fcr31 & FPU_CSR_UDF_X)
+		si.si_code = FPE_FLTUND;
+	else if (fcr31 & FPU_CSR_INE_X)
+		si.si_code = FPE_FLTRES;
+	else
+		si.si_code = __SI_FAULT;
+	force_sig_info(SIGFPE, &si, tsk);
 }
 
 int process_fpemu_return(int sig, void __user *fault_addr, unsigned long fcr31)
@@ -712,27 +741,7 @@ int process_fpemu_return(int sig, void __user *fault_addr, unsigned long fcr31)
 		return 0;
 
 	case SIGFPE:
-		si.si_addr = fault_addr;
-		si.si_signo = sig;
-		/*
-		 * Inexact can happen together with Overflow or Underflow.
-		 * Respect the mask to deliver the correct exception.
-		 */
-		fcr31 &= (fcr31 & FPU_CSR_ALL_E) <<
-			 (ffs(FPU_CSR_ALL_X) - ffs(FPU_CSR_ALL_E));
-		if (fcr31 & FPU_CSR_INV_X)
-			si.si_code = FPE_FLTINV;
-		else if (fcr31 & FPU_CSR_DIV_X)
-			si.si_code = FPE_FLTDIV;
-		else if (fcr31 & FPU_CSR_OVF_X)
-			si.si_code = FPE_FLTOVF;
-		else if (fcr31 & FPU_CSR_UDF_X)
-			si.si_code = FPE_FLTUND;
-		else if (fcr31 & FPU_CSR_INE_X)
-			si.si_code = FPE_FLTRES;
-		else
-			si.si_code = __SI_FAULT;
-		force_sig_info(sig, &si, current);
+		force_fcr31_sig(fcr31, fault_addr, current);
 		return 1;
 
 	case SIGBUS:
@@ -795,13 +804,13 @@ static int simulate_fp(struct pt_regs *regs, unsigned int opcode,
 	/* Run the emulator */
 	sig = fpu_emulator_cop1Handler(regs, &current->thread.fpu, 1,
 				       &fault_addr);
-	fcr31 = current->thread.fpu.fcr31;
 
 	/*
-	 * We can't allow the emulated instruction to leave any of
-	 * the cause bits set in $fcr31.
+	 * We can't allow the emulated instruction to leave any
+	 * enabled Cause bits set in $fcr31.
 	 */
-	current->thread.fpu.fcr31 &= ~FPU_CSR_ALL_X;
+	fcr31 = mask_fcr31_x(current->thread.fpu.fcr31);
+	current->thread.fpu.fcr31 &= ~fcr31;
 
 	/* Restore the hardware register state */
 	own_fpu(1);
@@ -827,7 +836,7 @@ asmlinkage void do_fpe(struct pt_regs *regs, unsigned long fcr31)
 		goto out;
 
 	/* Clear FCSR.Cause before enabling interrupts */
-	write_32bit_cp1_register(CP1_STATUS, fcr31 & ~FPU_CSR_ALL_X);
+	write_32bit_cp1_register(CP1_STATUS, fcr31 & ~mask_fcr31_x(fcr31));
 	local_irq_enable();
 
 	die_if_kernel("FP exception in kernel code", regs);
@@ -849,13 +858,13 @@ asmlinkage void do_fpe(struct pt_regs *regs, unsigned long fcr31)
 		/* Run the emulator */
 		sig = fpu_emulator_cop1Handler(regs, &current->thread.fpu, 1,
 					       &fault_addr);
-		fcr31 = current->thread.fpu.fcr31;
 
 		/*
-		 * We can't allow the emulated instruction to leave any of
-		 * the cause bits set in $fcr31.
+		 * We can't allow the emulated instruction to leave any
+		 * enabled Cause bits set in $fcr31.
 		 */
-		current->thread.fpu.fcr31 &= ~FPU_CSR_ALL_X;
+		fcr31 = mask_fcr31_x(current->thread.fpu.fcr31);
+		current->thread.fpu.fcr31 &= ~fcr31;
 
 		/* Restore the hardware register state */
 		own_fpu(1);	/* Using the FPU again.	 */
@@ -871,10 +880,10 @@ out:
 	exception_exit(prev_state);
 }
 
-void do_trap_or_bp(struct pt_regs *regs, unsigned int code,
+void do_trap_or_bp(struct pt_regs *regs, unsigned int code, int si_code,
 	const char *str)
 {
-	siginfo_t info;
+	siginfo_t info = { 0 };
 	char b[40];
 
 #ifdef CONFIG_KGDB_LOW_LEVEL_TRAP
@@ -903,7 +912,6 @@ void do_trap_or_bp(struct pt_regs *regs, unsigned int code,
 		else
 			info.si_code = FPE_INTOVF;
 		info.si_signo = SIGFPE;
-		info.si_errno = 0;
 		info.si_addr = (void __user *) regs->cp0_epc;
 		force_sig_info(SIGFPE, &info, current);
 		break;
@@ -929,7 +937,13 @@ void do_trap_or_bp(struct pt_regs *regs, unsigned int code,
 	default:
 		scnprintf(b, sizeof(b), "%s instruction in kernel code", str);
 		die_if_kernel(b, regs);
-		force_sig(SIGTRAP, current);
+		if (si_code) {
+			info.si_signo = SIGTRAP;
+			info.si_code = si_code;
+			force_sig_info(SIGTRAP, &info, current);
+		} else {
+			force_sig(SIGTRAP, current);
+		}
 	}
 }
 
@@ -1013,7 +1027,7 @@ asmlinkage void do_bp(struct pt_regs *regs)
 		break;
 	}
 
-	do_trap_or_bp(regs, bcode, "Break");
+	do_trap_or_bp(regs, bcode, TRAP_BRKPT, "Break");
 
 out:
 	set_fs(seg);
@@ -1055,7 +1069,7 @@ asmlinkage void do_tr(struct pt_regs *regs)
 			tcode = (opcode >> 6) & ((1 << 10) - 1);
 	}
 
-	do_trap_or_bp(regs, tcode, "Trap");
+	do_trap_or_bp(regs, tcode, 0, "Trap");
 
 out:
 	set_fs(seg);
@@ -1242,7 +1256,7 @@ static int enable_restore_fp_context(int msa)
 		err = init_fpu();
 		if (msa && !err) {
 			enable_msa();
-			_init_msa_upper();
+			init_msa_upper();
 			set_thread_flag(TIF_USEDMSA);
 			set_thread_flag(TIF_MSA_CTX_LIVE);
 		}
@@ -1305,7 +1319,7 @@ static int enable_restore_fp_context(int msa)
 	 */
 	prior_msa = test_and_set_thread_flag(TIF_MSA_CTX_LIVE);
 	if (!prior_msa && was_fpu_owner) {
-		_init_msa_upper();
+		init_msa_upper();
 
 		goto out;
 	}
@@ -1322,7 +1336,7 @@ static int enable_restore_fp_context(int msa)
 		 * of each vector register such that it cannot see data left
 		 * behind by another task.
 		 */
-		_init_msa_upper();
+		init_msa_upper();
 	} else {
 		/* We need to restore the vector context. */
 		restore_msa(current);
@@ -1429,13 +1443,13 @@ asmlinkage void do_cpu(struct pt_regs *regs)
 
 		sig = fpu_emulator_cop1Handler(regs, &current->thread.fpu, 0,
 					       &fault_addr);
-		fcr31 = current->thread.fpu.fcr31;
 
 		/*
 		 * We can't allow the emulated instruction to leave
-		 * any of the cause bits set in $fcr31.
+		 * any enabled Cause bits set in $fcr31.
 		 */
-		current->thread.fpu.fcr31 &= ~FPU_CSR_ALL_X;
+		fcr31 = mask_fcr31_x(current->thread.fpu.fcr31);
+		current->thread.fpu.fcr31 &= ~fcr31;
 
 		/* Send a signal if required.  */
 		if (!process_fpemu_return(sig, fault_addr, fcr31) && !err)
@@ -1506,6 +1520,7 @@ asmlinkage void do_mdmx(struct pt_regs *regs)
  */
 asmlinkage void do_watch(struct pt_regs *regs)
 {
+	siginfo_t info = { .si_signo = SIGTRAP, .si_code = TRAP_HWBKPT };
 	enum ctx_state prev_state;
 	u32 cause;
 
@@ -1526,7 +1541,7 @@ asmlinkage void do_watch(struct pt_regs *regs)
 	if (test_tsk_thread_flag(current, TIF_LOAD_WATCH)) {
 		mips_read_watch_registers();
 		local_irq_enable();
-		force_sig(SIGTRAP, current);
+		force_sig_info(SIGTRAP, &info, current);
 	} else {
 		mips_clear_watch_registers();
 		local_irq_enable();
@@ -2125,6 +2140,13 @@ void per_cpu_trap_init(bool is_boot_cpu)
 	 *  o read IntCtl.IPFDC to determine the fast debug channel interrupt
 	 */
 	if (cpu_has_mips_r2_r6) {
+		/*
+		 * We shouldn't trust a secondary core has a sane EBASE register
+		 * so use the one calculated by the boot CPU.
+		 */
+		if (!is_boot_cpu)
+			write_c0_ebase(ebase);
+
 		cp0_compare_irq_shift = CAUSEB_TI - CAUSEB_IP;
 		cp0_compare_irq = (read_c0_intctl() >> INTCTLB_IPTI) & 7;
 		cp0_perfcount_irq = (read_c0_intctl() >> INTCTLB_IPPCI) & 7;
@@ -2228,7 +2250,7 @@ void __init trap_init(void)
 
 	/*
 	 * Copy the generic exception handlers to their final destination.
-	 * This will be overriden later as suitable for a particular
+	 * This will be overridden later as suitable for a particular
 	 * configuration.
 	 */
 	set_handler(0x180, &except_vec3_generic, 0x80);
