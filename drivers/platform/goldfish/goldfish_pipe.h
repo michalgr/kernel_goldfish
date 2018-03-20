@@ -84,8 +84,14 @@ struct goldfish_pipe_dev {
 
 	/* v1-specific access parameters */
 	struct access_params *aps;
+
+	/* DMA info */
+	size_t dma_alloc_total;
+
+	/* ptr to platform device's device struct */
+	struct device *pdev_dev;
 };
 
-extern struct goldfish_pipe_dev pipe_dev[1];
+extern struct goldfish_pipe_dev goldfish_pipe_dev[1];
 
 #endif /* GOLDFISH_PIPE_H */
