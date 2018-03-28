@@ -36,9 +36,7 @@ enum {
 
 	GOLDFISH_TTY_DATA_PTR       = 0x10,
 	GOLDFISH_TTY_DATA_LEN       = 0x14,
-#ifdef CONFIG_64BIT
 	GOLDFISH_TTY_DATA_PTR_HIGH  = 0x18,
-#endif
 
 	GOLDFISH_TTY_VERSION		= 0x20,
 
@@ -75,10 +73,8 @@ static void do_rw_io(struct goldfish_tty *qtty,
 	void __iomem *base = qtty->base;
 
 	spin_lock_irqsave(&qtty->lock, irq_flags);
-	writel((u32)address, base + GOLDFISH_TTY_DATA_PTR);
-#ifdef CONFIG_64BIT
-	writel((u32)((u64)address >> 32), base + GOLDFISH_TTY_DATA_PTR_HIGH);
-#endif
+	gf_write_ptr(address, base + GOLDFISH_TTY_DATA_PTR,
+		base + GOLDFISH_TTY_DATA_PTR_HIGH);
 	writel(count, base + GOLDFISH_TTY_DATA_LEN);
 
 	if (is_write)
