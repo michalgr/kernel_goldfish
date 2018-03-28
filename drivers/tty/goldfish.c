@@ -111,7 +111,7 @@ static inline void goldfish_tty_rw(struct goldfish_tty *qtty,
 			/* Map the buffer's virtual address to the DMA address
 			 * so the buffer can be accessed by the device.
 			 */
-			dma_handle = dma_map_single(qtty->dev, (void *)addr,
+			dma_handle = dma_map_single(qtty->dev, (void *)address,
 						    avail, dma_dir);
 
 			if (dma_mapping_error(qtty->dev, dma_handle)) {
