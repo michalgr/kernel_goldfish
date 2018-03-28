@@ -30,21 +30,21 @@
 
 enum {
 	/* Goldfish tty register's offsets */
-	GOLDFISH_TTY_PUT_CHAR       = 0x00,
-	GOLDFISH_TTY_BYTES_READY    = 0x04,
-	GOLDFISH_TTY_CMD            = 0x08,
+	GOLDFISH_TTY_PUT_CHAR		= 0x00,
+	GOLDFISH_TTY_BYTES_READY	= 0x04,
+	GOLDFISH_TTY_CMD		= 0x08,
 
-	GOLDFISH_TTY_DATA_PTR       = 0x10,
-	GOLDFISH_TTY_DATA_LEN       = 0x14,
-	GOLDFISH_TTY_DATA_PTR_HIGH  = 0x18,
+	GOLDFISH_TTY_DATA_PTR		= 0x10,
+	GOLDFISH_TTY_DATA_LEN		= 0x14,
+	GOLDFISH_TTY_DATA_PTR_HIGH	= 0x18,
 
 	GOLDFISH_TTY_VERSION		= 0x20,
 
 	/* Goldfish tty commands */
-	GOLDFISH_TTY_CMD_INT_DISABLE    = 0,
-	GOLDFISH_TTY_CMD_INT_ENABLE     = 1,
-	GOLDFISH_TTY_CMD_WRITE_BUFFER   = 2,
-	GOLDFISH_TTY_CMD_READ_BUFFER    = 3,
+	GOLDFISH_TTY_CMD_INT_DISABLE	= 0,
+	GOLDFISH_TTY_CMD_INT_ENABLE	= 1,
+	GOLDFISH_TTY_CMD_WRITE_BUFFER	= 2,
+	GOLDFISH_TTY_CMD_READ_BUFFER	= 3,
 };
 
 struct goldfish_tty {
@@ -85,9 +85,11 @@ static void do_rw_io(struct goldfish_tty *qtty,
 	spin_unlock_irqrestore(&qtty->lock, irq_flags);
 }
 
-static inline void goldfish_tty_rw(struct goldfish_tty *qtty,
-								   unsigned long address,
-								   unsigned count, int is_write)
+static inline void goldfish_tty_rw(
+	struct goldfish_tty *qtty,
+	unsigned long address,
+	unsigned count,
+	int is_write)
 {
 	dma_addr_t dma_handle;
 	enum dma_data_direction dma_dir;
