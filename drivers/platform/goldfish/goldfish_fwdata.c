@@ -166,9 +166,10 @@ static void remove_folder_with_file(struct kobject *kobj,
 	kobject_put(kobj);
 }
 
-static struct kobject *create_folder_with_files(struct kobject *parent,
-						const char *name,
-						struct attribute_group *group)
+static struct kobject *create_folder_with_files(
+	struct kobject *parent,
+	const char *name,
+	const struct attribute_group *group)
 {
 	struct kobject *kobj;
 
@@ -192,7 +193,7 @@ static struct kobject *create_folder_with_files(struct kobject *parent,
 }
 
 static void remove_folder_with_files(struct kobject *kobj,
-				     struct attribute_group *group)
+				     const struct attribute_group *group)
 {
 	sysfs_remove_group(kobj, group);
 	kobject_put(kobj);
