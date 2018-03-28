@@ -152,8 +152,8 @@ static irqreturn_t goldfish_tty_interrupt(int irq, void *dev_id)
 	unsigned char *buf;
 	u32 count;
 
-	if (count == 0)
 	count = readl(base + GOLDFISH_TTY_BYTES_READY);
+	if (count == 0)
 		return IRQ_NONE;
 
 	count = tty_prepare_flip_string(&qtty->port, &buf, count);
