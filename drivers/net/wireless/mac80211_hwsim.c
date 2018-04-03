@@ -1514,7 +1514,7 @@ static int mac80211_hwsim_config(struct ieee80211_hw *hw, u32 changed)
 	};
 
 	if (changed & IEEE80211_CONF_CHANGE_PS) {
-		bool enabled = conf->flags & IEEE80211_CONF_PS;
+		bool enabled = (conf->flags & IEEE80211_CONF_PS) != 0;
 		mac80211_power_state_changed(enabled);
 	}
 
