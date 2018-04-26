@@ -612,16 +612,10 @@ static struct goldfish_pipe *signalled_pipes_pop_front(
 
 static void goldfish_pipe_dma_clear_lock(struct goldfish_pipe *pipe)
 {
-	pr_debug("PIPE_WAKE_UNLOCK_DMA: unlock pipe dma for pipe 0x%p\n", pipe);
-	BUG_ON(!mutex_is_locked(&pipe->lock));
-
-	if (!pipe->closing) {
-		struct goldfish_dma_context *dma = pipe->dma;
-		if (dma) {
-			clear_bit(BIT_WAKE_ON_UNLOCK_DMA, &pipe->flags);
-			mutex_unlock(&pipe->lock);
-		}
-	}
+	/* There's no need for a guest/host locking mechanism for goldfish_dma
+	 * when we have other ways to synchronize guest and host already.
+	 * Retain this function only for backward compatibility.
+	 */
 }
 
 static void goldfish_interrupt_task(unsigned long unused)
@@ -1039,24 +1033,11 @@ static int goldfish_pipe_dma_create_region(
 
 static int goldfish_pipe_dma_acquire_lock(struct goldfish_pipe *pipe)
 {
-	if (mutex_trylock(&pipe->lock)) {
-		if (pipe->closing) {
-			mutex_unlock(&pipe->lock);
-			return -ENODEV;
-		} else {
-			struct goldfish_dma_context *dma = pipe->dma;
-			if (dma) {
-				return 0;
-			} else {
-				pr_err("No dma context for this pipe!");
-				mutex_unlock(&pipe->lock);
-				return -EINVAL;
-			}
-		}
-	} else {
-		set_bit(BIT_WAKE_ON_UNLOCK_DMA, &pipe->flags);
-		return goldfish_pipe_wait_event(BIT_WAKE_ON_UNLOCK_DMA, pipe);
-	}
+	/* There's no need for a guest/host locking mechanism for goldfish_dma
+	 * when we have other ways to synchronize guest and host already.
+	 * Retain this function only for backward compatibility.
+	 */
+	return 0;
 }
 
 static long goldfish_dma_ioctl(
