@@ -26,6 +26,9 @@
 #include <linux/io.h>
 #include <linux/acpi.h>
 
+#define POWER_SUPPLY_CURRENT_UA (900000) /* in uAmp */
+#define POWER_SUPPLY_CHARGE_FULL_UAH (300000) /* in uAmp*H */
+
 struct goldfish_battery_data {
 	void __iomem *reg_base;
 	int irq;
@@ -124,6 +127,18 @@ static int goldfish_battery_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
 		val->intval = GOLDFISH_BATTERY_READ(data, BATTERY_CHARGE_COUNTER);
 		break;
+	case POWER_SUPPLY_PROP_CURRENT_NOW:
+		val->intval = POWER_SUPPLY_CURRENT_UA;
+		break;
+	case POWER_SUPPLY_PROP_CURRENT_AVG:
+		val->intval = POWER_SUPPLY_CURRENT_UA;
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_FULL:
+		val->intval = POWER_SUPPLY_CHARGE_FULL_UAH;
+		break;
+	case POWER_SUPPLY_PROP_CYCLE_COUNT:
+		val->intval = 10;
+		break;
 	default:
 		ret = -EINVAL;
 		break;
@@ -141,6 +156,10 @@ static enum power_supply_property goldfish_battery_props[] = {
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_TEMP,
 	POWER_SUPPLY_PROP_CHARGE_COUNTER,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_CURRENT_AVG,
+	POWER_SUPPLY_PROP_CHARGE_FULL,
+	POWER_SUPPLY_PROP_CYCLE_COUNT,
 };
 
 static enum power_supply_property goldfish_ac_props[] = {
