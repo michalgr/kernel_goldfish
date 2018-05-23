@@ -1,0 +1,23 @@
+/dts-v1/;
+
+/ {
+
+        firmware {
+
+                android {
+                        compatible = "android,firmware";
+
+                        fstab {
+                                compatible = "android,fstab";
+
+                                vendor {
+                                        compatible = "android,vendor";
+                                        dev = "/dev/block/pci/pci0000:00/0000:00:20.0/by-name/vendor";
+                                        type = "ext4";
+                                        mnt_flags = "noatime,ro,errors=panic";
+                                        fsmgr_flags = "wait";
+                                };
+                        };
+                };
+        };
+};
