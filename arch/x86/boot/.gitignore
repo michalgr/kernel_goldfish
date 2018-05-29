@@ -1,5 +1,5 @@
 bootsect
-bzImage*
+bzImage
 cpustr.h
 mkcpustr
 voffset.h

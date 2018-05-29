@@ -265,13 +265,6 @@ boot := arch/x86/boot
 
 BOOT_TARGETS = bzlilo bzdisk fdimage fdimage144 fdimage288 isoimage
 
-ifeq ($(CONFIG_USE_OF),y)
-# Build the DT binary blobs if requested
-DTBS_DEPS := dtbs
-else
-DTBS_DEPS := # none
-endif
-
 PHONY += bzImage $(BOOT_TARGETS)
 
 # Default kernel to build
@@ -280,7 +273,7 @@ all: bzImage
 # KBUILD_IMAGE specify target image being built
 KBUILD_IMAGE := $(boot)/bzImage
 
-bzImage: vmlinux $(DTBS_DEPS)
+bzImage: vmlinux
 ifeq ($(CONFIG_X86_DECODER_SELFTEST),y)
 	$(Q)$(MAKE) $(build)=arch/x86/tools posttest
 endif
@@ -294,17 +287,6 @@ $(BOOT_TARGETS): vmlinux
 PHONY += install
 install:
 	$(Q)$(MAKE) $(build)=$(boot) $@
-
-%.dtb: | scripts
-	$(Q)$(MAKE) $(build)=$(boot)/dts $(boot)/dts/$@
-
-PHONY += dtbs dtbs_install
-
-dtbs: prepare scripts
-	$(Q)$(MAKE) $(build)=$(boot)/dts
-
-dtbs_install:
-	$(Q)$(MAKE) $(dtbinst)=$(boot)/dts
 
 PHONY += vdso_install
 vdso_install:

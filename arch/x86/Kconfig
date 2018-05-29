@@ -2695,20 +2695,6 @@ config PMC_ATOM
 	def_bool y
         depends on PCI
 
-config USE_OF
-	bool "Flattened Device Tree support"
-	select OF
-	select OF_UNITTEST
-	help
-	  Include support for flattened device tree machine descriptions.
-
-config BUILD_X86_APPENDED_DTB_IMAGE_NAME
-	string "The dtb filename to build and append"
-	depends on USE_OF
-	help
-	  The dtb filename to build and append when building a
-	  concatenated kernel.
-
 source "net/Kconfig"
 
 source "drivers/Kconfig"

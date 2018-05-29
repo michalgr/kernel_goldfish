@@ -9,8 +9,6 @@
 # Changed by many, many contributors over the years.
 #
 
-include $(srctree)/arch/x86/boot/dts/Makefile
-
 KASAN_SANITIZE := n
 
 # Kernel does not boot with kcov instrumentation here.
@@ -70,28 +68,16 @@ KBUILD_CFLAGS	:= $(USERINCLUDE) $(REALMODE_CFLAGS) -D_SETUP
 KBUILD_AFLAGS	:= $(KBUILD_CFLAGS) -D__ASSEMBLY__
 GCOV_PROFILE := n
 
+$(obj)/bzImage: asflags-y  := $(SVGA_MODE)
+
 quiet_cmd_image = BUILD   $@
 silent_redirect_image = >/dev/null
 cmd_image = $(obj)/tools/build $(obj)/setup.bin $(obj)/vmlinux.bin \
 			       $(obj)/zoffset.h $@ $($(quiet)redirect_image)
 
-DTB_LIST := $(dtb-y)
-DTB_OBJS := $(addprefix $(obj)/dts/,$(DTB_LIST))
-
-$(obj)/bzImage-nodtb: asflags-y  := $(SVGA_MODE)
-
-$(obj)/bzImage-nodtb: $(obj)/setup.bin $(obj)/vmlinux.bin $(obj)/tools/build FORCE
+$(obj)/bzImage: $(obj)/setup.bin $(obj)/vmlinux.bin $(obj)/tools/build FORCE
 	$(call if_changed,image)
-
-ifeq ($(CONFIG_USE_OF),y)
-$(obj)/bzImage: $(obj)/bzImage-nodtb $(DTB_OBJS) FORCE
-	$(call if_changed,cat)
 	@$(kecho) 'Kernel: $@ is ready' ' (#'`cat .version`')'
-else
-$(obj)/bzImage: $(obj)/bzImage-nodtb FORCE
-	$(call if_changed,cat)
-	@$(kecho) 'Kernel: $@ is ready' ' (#'`cat .version`')'
-endif
 
 OBJCOPYFLAGS_vmlinux.bin := -O binary -R .note -R .comment -S
 $(obj)/vmlinux.bin: $(obj)/compressed/vmlinux FORCE
