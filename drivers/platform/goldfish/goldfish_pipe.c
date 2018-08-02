@@ -506,7 +506,7 @@ static irqreturn_t goldfish_pipe_interrupt(int irq, void *dev_id)
 static int goldfish_pipe_open(struct inode *inode, struct file *file)
 {
 	struct goldfish_pipe *pipe;
-	struct goldfish_pipe_dev *dev = goldfish_pipe_dev;
+	struct goldfish_pipe_dev *dev = &goldfish_pipe_dev;
 	int32_t status;
 
 	/* Allocate new pipe kernel object */
@@ -566,7 +566,7 @@ static struct miscdevice goldfish_pipe_miscdev = {
 
 int goldfish_pipe_device_init_v1(struct platform_device *pdev)
 {
-	struct goldfish_pipe_dev *dev = goldfish_pipe_dev;
+	struct goldfish_pipe_dev *dev = &goldfish_pipe_dev;
 	int err = devm_request_irq(&pdev->dev, dev->irq,
 		goldfish_pipe_interrupt, IRQF_SHARED, "goldfish_pipe", dev);
 
