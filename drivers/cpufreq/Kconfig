@@ -46,6 +46,13 @@ config CPU_FREQ_STAT_DETAILS
 
 	  If in doubt, say N.
 
+config CPU_FREQ_STAT_GOLDFISH
+	bool "Goldfish Fake CpuFreq Stats"
+	depends on !CPU_FREQ_STAT && GOLDFISH
+	help
+	  Say Y to enable support for the fake cpufreq stats in the
+	  Goldfish emulator.
+
 config CPU_FREQ_TIMES
        bool "CPU frequency time-in-state statistics"
        default y
