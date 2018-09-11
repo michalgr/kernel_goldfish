@@ -167,9 +167,9 @@ int copy_thread_tls(unsigned long clone_flags, unsigned long sp,
 	p->thread.io_bitmap_ptr = NULL;
 
 	savesegment(gs, p->thread.gsindex);
-	p->thread.gs = p->thread.gsindex ? 0 : me->thread.gs;
+	p->thread.gsbase = p->thread.gsindex ? 0 : me->thread.gsbase;
 	savesegment(fs, p->thread.fsindex);
-	p->thread.fs = p->thread.fsindex ? 0 : me->thread.fs;
+	p->thread.fsbase = p->thread.fsindex ? 0 : me->thread.fsbase;
 	savesegment(es, p->thread.es);
 	savesegment(ds, p->thread.ds);
 	memset(p->thread.ptrace_bps, 0, sizeof(p->thread.ptrace_bps));
@@ -343,7 +343,7 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 	 * next base address zero, writing 0 to the segment register is
 	 * much faster than using wrmsr to explicitly zero the base.
 	 *
-	 * The thread_struct.fs and thread_struct.gs values are 0
+	 * The thread_struct.fsbase and thread_struct.gsbase values are 0
 	 * if the fs and gs bases respectively are not overridden
 	 * from the values implied by fsindex and gsindex.  They
 	 * are nonzero, and store the nonzero base addresses, if
@@ -365,7 +365,7 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 	 * user code can override the segment base.  Once wrfsbase and
 	 * wrgsbase are enabled, most of this code will need to change.
 	 */
-	if (unlikely(fsindex | next->fsindex | prev->fs)) {
+	if (unlikely(fsindex | next->fsindex | prev->fsbase)) {
 		loadsegment(fs, next->fsindex);
 
 		/*
@@ -378,21 +378,21 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 		 * the process.
 		 */
 		if (fsindex)
-			prev->fs = 0;
+			prev->fsbase = 0;
 	}
-	if (next->fs)
-		wrmsrl(MSR_FS_BASE, next->fs);
+	if (next->fsbase)
+		wrmsrl(MSR_FS_BASE, next->fsbase);
 	prev->fsindex = fsindex;
 
-	if (unlikely(gsindex | next->gsindex | prev->gs)) {
+	if (unlikely(gsindex | next->gsindex | prev->gsbase)) {
 		load_gs_index(next->gsindex);
 
 		/* This works (and fails) the same way as fsindex above. */
 		if (gsindex)
-			prev->gs = 0;
+			prev->gsbase = 0;
 	}
-	if (next->gs)
-		wrmsrl(MSR_KERNEL_GS_BASE, next->gs);
+	if (next->gsbase)
+		wrmsrl(MSR_KERNEL_GS_BASE, next->gsbase);
 	prev->gsindex = gsindex;
 
 	switch_fpu_finish(next_fpu, fpu_switch);
@@ -523,10 +523,10 @@ long do_arch_prctl(struct task_struct *task, int code, unsigned long addr)
 				load_gs_index(GS_TLS_SEL);
 			}
 			task->thread.gsindex = GS_TLS_SEL;
-			task->thread.gs = 0;
+			task->thread.gsbase = 0;
 		} else {
 			task->thread.gsindex = 0;
-			task->thread.gs = addr;
+			task->thread.gsbase = addr;
 			if (doit) {
 				load_gs_index(0);
 				ret = wrmsrl_safe(MSR_KERNEL_GS_BASE, addr);
@@ -549,10 +549,10 @@ long do_arch_prctl(struct task_struct *task, int code, unsigned long addr)
 				loadsegment(fs, FS_TLS_SEL);
 			}
 			task->thread.fsindex = FS_TLS_SEL;
-			task->thread.fs = 0;
+			task->thread.fsbase = 0;
 		} else {
 			task->thread.fsindex = 0;
-			task->thread.fs = addr;
+			task->thread.fsbase = addr;
 			if (doit) {
 				/* set the selector to 0 to not confuse
 				   __switch_to */
@@ -569,7 +569,7 @@ long do_arch_prctl(struct task_struct *task, int code, unsigned long addr)
 		else if (doit)
 			rdmsrl(MSR_FS_BASE, base);
 		else
-			base = task->thread.fs;
+			base = task->thread.fsbase;
 		ret = put_user(base, (unsigned long __user *)addr);
 		break;
 	}
@@ -583,9 +583,9 @@ long do_arch_prctl(struct task_struct *task, int code, unsigned long addr)
 			if (gsindex)
 				rdmsrl(MSR_KERNEL_GS_BASE, base);
 			else
-				base = task->thread.gs;
+				base = task->thread.gsbase;
 		} else
-			base = task->thread.gs;
+			base = task->thread.gsbase;
 		ret = put_user(base, (unsigned long __user *)addr);
 		break;
 	}

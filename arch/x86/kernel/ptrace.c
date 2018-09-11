@@ -323,9 +323,9 @@ static int set_segment_reg(struct task_struct *task,
 		 * setting fs_base has implicitly changed it, leave it.
 		 */
 		if ((value == FS_TLS_SEL && task->thread.fsindex == 0 &&
-		     task->thread.fs != 0) ||
+		     task->thread.fsbase != 0) ||
 		    (value == 0 && task->thread.fsindex == FS_TLS_SEL &&
-		     task->thread.fs == 0))
+		     task->thread.fsbase == 0))
 			break;
 		task->thread.fsindex = value;
 		if (task == current)
@@ -337,9 +337,9 @@ static int set_segment_reg(struct task_struct *task,
 		 * setting gs_base has implicitly changed it, leave it.
 		 */
 		if ((value == GS_TLS_SEL && task->thread.gsindex == 0 &&
-		     task->thread.gs != 0) ||
+		     task->thread.gsbase != 0) ||
 		    (value == 0 && task->thread.gsindex == GS_TLS_SEL &&
-		     task->thread.gs == 0))
+		     task->thread.gsbase == 0))
 			break;
 		task->thread.gsindex = value;
 		if (task == current)
@@ -429,10 +429,10 @@ static int putreg(struct task_struct *child,
 			return -EIO;
 		/*
 		 * When changing the segment base, use do_arch_prctl
-		 * to set either thread.fs or thread.fsindex and the
+		 * to set either thread.fsbase or thread.fsindex and the
 		 * corresponding GDT slot.
 		 */
-		if (child->thread.fs != value)
+		if (child->thread.fsbase != value)
 			return do_arch_prctl(child, ARCH_SET_FS, value);
 		return 0;
 	case offsetof(struct user_regs_struct,gs_base):
@@ -441,7 +441,7 @@ static int putreg(struct task_struct *child,
 		 */
 		if (value >= TASK_SIZE_OF(child))
 			return -EIO;
-		if (child->thread.gs != value)
+		if (child->thread.gsbase != value)
 			return do_arch_prctl(child, ARCH_SET_GS, value);
 		return 0;
 #endif
@@ -473,8 +473,8 @@ static unsigned long getreg(struct task_struct *task, unsigned long offset)
 		 * way, except the %fs segment selector might not be 0.
 		 */
 		unsigned int seg = task->thread.fsindex;
-		if (task->thread.fs != 0)
-			return task->thread.fs;
+		if (task->thread.fsbase != 0)
+			return task->thread.fsbase;
 		if (task == current)
 			asm("movl %%fs,%0" : "=r" (seg));
 		if (seg != FS_TLS_SEL)
@@ -486,8 +486,8 @@ static unsigned long getreg(struct task_struct *task, unsigned long offset)
 		 * Exactly the same here as the %fs handling above.
 		 */
 		unsigned int seg = task->thread.gsindex;
-		if (task->thread.gs != 0)
-			return task->thread.gs;
+		if (task->thread.gsbase != 0)
+			return task->thread.gsbase;
 		if (task == current)
 			asm("movl %%gs,%0" : "=r" (seg));
 		if (seg != GS_TLS_SEL)
