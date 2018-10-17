@@ -546,6 +546,14 @@ config MEMORY_STATE_TIME
 	help
 	  Memory time statistics exported to /sys/kernel/memory_state_time
 
+config GOLDFISH_ADDRESS_SPACE
+	tristate "A Goldfish driver that helps sharing host's memory with the guest"
+	depends on GOLDFISH
+	---help---
+	  A Goldfish driver that allocates address space ranges in the guest to
+	  populate them later in the host. This allows sharing host's memory with
+	  the guest.
+
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
 source "drivers/misc/cb710/Kconfig"
