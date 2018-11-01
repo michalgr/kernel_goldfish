@@ -764,14 +764,6 @@ DEFINE_SIMPLE_ATTRIBUTE(hwsim_fops_group,
 			hwsim_fops_group_read, hwsim_fops_group_write,
 			"%llx\n");
 
-static netdev_tx_t hwsim_mon_xmit(struct sk_buff *skb,
-					struct net_device *dev)
-{
-	/* TODO: allow packet injection */
-	dev_kfree_skb(skb);
-	return NETDEV_TX_OK;
-}
-
 static inline u64 mac80211_hwsim_get_tsf_raw(void)
 {
 	return ktime_to_us(ktime_get_boottime());
@@ -808,7 +800,7 @@ static void mac80211_hwsim_set_tsf(struct ieee80211_hw *hw,
 	}
 }
 
-static void mac80211_hwsim_monitor_rx(struct ieee80211_hw *hw,
+static bool mac80211_hwsim_monitor_rx(struct ieee80211_hw *hw,
 				      struct sk_buff *tx_skb,
 				      struct ieee80211_channel *chan)
 {
@@ -820,11 +812,11 @@ static void mac80211_hwsim_monitor_rx(struct ieee80211_hw *hw,
 	struct ieee80211_rate *txrate = ieee80211_get_tx_rate(hw, info);
 
 	if (!netif_running(hwsim_mon))
-		return;
+		return false;
 
 	skb = skb_copy_expand(tx_skb, sizeof(*hdr), 0, GFP_ATOMIC);
 	if (skb == NULL)
-		return;
+		return false;
 
 	hdr = (struct hwsim_radiotap_hdr *) skb_push(skb, sizeof(*hdr));
 	hdr->hdr.it_version = PKTHDR_RADIOTAP_VERSION;
@@ -852,6 +844,7 @@ static void mac80211_hwsim_monitor_rx(struct ieee80211_hw *hw,
 	skb->protocol = htons(ETH_P_802_2);
 	memset(skb->cb, 0, sizeof(skb->cb));
 	netif_rx(skb);
+	return true;
 }
 
 
@@ -1055,6 +1048,28 @@ static bool hwsim_chans_compat(struct ieee80211_channel *c1,
 		return false;
 
 	return c1->center_freq == c2->center_freq;
+}
+
+static bool hwsim_get_chan(u16 freq, struct ieee80211_channel *chan)
+{
+	const struct ieee80211_channel *channel;
+	const struct ieee80211_channel *end;
+	int i;
+
+	channel = &hwsim_channels_2ghz[0],
+	end = channel + ARRAY_SIZE(hwsim_channels_2ghz);
+	for (i = 0; i < 2; i++) {
+		for (; channel != end; channel++) {
+			if (freq == channel->center_freq) {
+				*chan = *channel;
+				return true;
+			}
+		}
+		channel = &hwsim_channels_5ghz[0];
+		end = channel + ARRAY_SIZE(hwsim_channels_5ghz);
+	}
+
+	return false;
 }
 
 struct tx_iter_data {
@@ -1318,7 +1333,7 @@ static void mac80211_hwsim_tx(struct ieee80211_hw *hw,
 				    24 * 8 * 10 / txrate->bitrate);
 	}
 
-	mac80211_hwsim_monitor_rx(hw, skb, channel);
+	ack = mac80211_hwsim_monitor_rx(hw, skb, channel);
 
 	/* wmediumd mode check */
 	_portid = ACCESS_ONCE(wmediumd_portid);
@@ -1329,7 +1344,8 @@ static void mac80211_hwsim_tx(struct ieee80211_hw *hw,
 	/* NO wmediumd detected, perfect medium simulation */
 	data->tx_pkts++;
 	data->tx_bytes += skb->len;
-	ack = mac80211_hwsim_tx_frame_no_nl(hw, skb, channel);
+	if (mac80211_hwsim_tx_frame_no_nl(hw, skb, channel))
+		ack = true;
 
 	if (ack && skb->len >= 16) {
 		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *) skb->data;
@@ -1347,6 +1363,151 @@ static void mac80211_hwsim_tx(struct ieee80211_hw *hw,
 	ieee80211_tx_status_irqsafe(hw, skb);
 }
 
+static int hwsim_radiotap_to_rx_status(struct ieee80211_radiotap_header *rt,
+				       int max_length,
+				       struct ieee80211_rx_status *status)
+{
+	struct ieee80211_radiotap_iterator itr;
+	int ret, i;
+	u64 now;
+	u16 bitrate;
+
+	ret = ieee80211_radiotap_iterator_init(&itr, rt, max_length, NULL);
+	if (ret != 0) {
+		return ret;
+	}
+	now = mac80211_hwsim_get_tsf_raw();
+
+	while (ieee80211_radiotap_iterator_next(&itr) == 0) {
+		switch (itr.this_arg_index) {
+		case IEEE80211_RADIOTAP_TSFT:
+			status->flag |= RX_FLAG_MACTIME_START;
+			status->mactime = get_unaligned_le64(itr.this_arg);
+			break;
+		case IEEE80211_RADIOTAP_RATE:
+			bitrate = *((u8*)itr.this_arg) * 5;
+			for (i = 0; i < ARRAY_SIZE(hwsim_rates); i++) {
+				if (bitrate == hwsim_rates[i].bitrate) {
+					status->rate_idx = i;
+					break;
+				}
+			}
+			break;
+		case IEEE80211_RADIOTAP_CHANNEL:
+			status->freq = get_unaligned_le16(itr.this_arg);
+			break;
+		case IEEE80211_RADIOTAP_DBM_ANTSIGNAL:
+			status->signal = *((s8*)itr.this_arg);
+			break;
+		case IEEE80211_RADIOTAP_ANTENNA:
+			status->antenna = *((u8*)itr.this_arg);
+			break;
+		default:
+			break;
+		}
+	}
+	return 0;
+}
+
+static netdev_tx_t hwsim_mon_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct mac80211_hwsim_data *data;
+	struct ieee80211_channel chan;
+	struct ieee80211_rx_status rx_status;
+	struct ieee80211_radiotap_header *radiotap;
+	u64 now;
+	int rtap_len;
+
+	radiotap = (struct ieee80211_radiotap_header *)skb->data;
+
+	if (skb->len <= sizeof(*radiotap))
+		goto out;
+
+	if (radiotap->it_version != 0)
+		goto out;
+
+	rtap_len = ieee80211_get_radiotap_len(skb->data);
+	if (skb->len <= rtap_len )
+		goto out;
+
+	memset(&rx_status, 0, sizeof(rx_status));
+	if (hwsim_radiotap_to_rx_status(radiotap, skb->len, &rx_status) != 0) {
+		goto out;
+	}
+
+	if (!hwsim_get_chan(rx_status.freq, &chan))
+		goto out;
+
+	rx_status.freq = chan.center_freq;
+	rx_status.band = chan.band;
+
+	/* Remove radiotap header, it should not be injected */
+	skb_pull(skb, rtap_len);
+
+	now = mac80211_hwsim_get_tsf_raw();
+
+	/* Copy skb to all enabled radios that are on the current frequency */
+	spin_lock(&hwsim_radio_lock);
+	list_for_each_entry(data, &hwsim_radios, list) {
+		struct sk_buff *nskb;
+		struct tx_iter_data tx_iter_data = {
+			.receive = false,
+			.channel = &chan,
+		};
+
+		if (!data->started || (data->idle && !data->tmp_chan) ||
+		    !hwsim_ps_rx_ok(data, skb))
+			continue;
+
+		if (!hwsim_chans_compat(&chan, data->tmp_chan) &&
+		    !hwsim_chans_compat(&chan, data->channel)) {
+			ieee80211_iterate_active_interfaces_atomic(
+				data->hw, IEEE80211_IFACE_ITER_NORMAL,
+				mac80211_hwsim_tx_iter, &tx_iter_data);
+			if (!tx_iter_data.receive) {
+				continue;
+			}
+		}
+
+		/*
+		 * reserve some space for our vendor and the normal
+		 * radiotap header, since we're copying anyway
+		 */
+		if (skb->len < PAGE_SIZE && paged_rx) {
+			struct page *page = alloc_page(GFP_ATOMIC);
+
+			if (!page)
+				continue;
+
+			nskb = dev_alloc_skb(128);
+			if (!nskb) {
+				__free_page(page);
+				continue;
+			}
+
+			memcpy(page_address(page), skb->data, skb->len);
+			skb_add_rx_frag(nskb, 0, page, 0, skb->len, skb->len);
+		} else {
+			nskb = skb_copy(skb, GFP_ATOMIC);
+			if (!nskb)
+				continue;
+		}
+
+		rx_status.mactime = now + data->tsf_offset;
+
+		memcpy(IEEE80211_SKB_RXCB(nskb), &rx_status, sizeof(rx_status));
+
+		mac80211_hwsim_add_vendor_rtap(nskb);
+
+		data->rx_pkts++;
+		data->rx_bytes += nskb->len;
+		ieee80211_rx_irqsafe(data->hw, nskb);
+	}
+	spin_unlock(&hwsim_radio_lock);
+out:
+	dev_kfree_skb(skb);
+	return NETDEV_TX_OK;
+}
 
 static int mac80211_hwsim_start(struct ieee80211_hw *hw)
 {
