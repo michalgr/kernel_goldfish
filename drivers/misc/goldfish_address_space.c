@@ -39,7 +39,6 @@ enum as_command_id {
 	AS_COMMAND_DEALLOCATE_BLOCK = 2,
 };
 
-#define AS_DEVICE_NAME		"goldfish_address_space"
 #define AS_PCI_VENDOR_ID	0x607D
 #define AS_PCI_DEVICE_ID	0xF153
 #define AS_MAGIC_U32		(AS_PCI_VENDOR_ID << 16 | AS_PCI_DEVICE_ID)
@@ -55,14 +54,13 @@ struct as_driver_state;
 struct as_device_state {
 	u32	magic;
 
-	struct list_head	node;
 	struct miscdevice	miscdevice;
 	struct pci_dev		*dev;
 	struct as_driver_state	*driver_state;
 
 	void __iomem		*io_registers;
 
-	void			*address_area;	/* to clain the address space */
+	void			*address_area;	/* to claim the address space */
 
 	/* physical address to allocate from */
 	unsigned long		address_area_phys_address;
@@ -75,8 +73,7 @@ struct as_device_state {
 };
 
 struct as_driver_state {
-	struct list_head devices;	/* of struct as_device_state */
-	struct mutex devices_lock;	/* protects devices */
+	struct as_device_state *device_state;
 	struct pci_driver pci;
 };
 
@@ -113,40 +110,30 @@ static u32 as_read_register(void __iomem *registers, int offset)
 }
 
 static int
-as_talk_to_hardware(struct as_device_state *state,
-			       enum as_command_id cmd)
+as_talk_to_hardware(struct as_device_state *state, enum as_command_id cmd)
 {
 	state->hw_done = 0;
-
-	as_write_register(state->io_registers,
-			  AS_REGISTER_COMMAND,
-			  cmd);
-
-	while (!state->hw_done) {
-		if (wait_event_interruptible(state->wake_queue,
-			state->hw_done))
-			return -ERESTARTSYS;
-	}
-
+	as_write_register(state->io_registers, AS_REGISTER_COMMAND, cmd);
+	wait_event(state->wake_queue, state->hw_done);
 	return -as_read_register(state->io_registers,
-					    AS_REGISTER_STATUS);
+				 AS_REGISTER_STATUS);
 }
 
 static long
 as_ioctl_allocate_block_locked_impl(struct as_device_state *state,
-					       u64 *size, u64 *offset)
+				    u64 *size, u64 *offset)
 {
 	long res;
 
 	as_write_register(state->io_registers,
-				     AS_REGISTER_BLOCK_SIZE_LOW,
-				     lower_32_bits(*size));
+			  AS_REGISTER_BLOCK_SIZE_LOW,
+			  lower_32_bits(*size));
 	as_write_register(state->io_registers,
-				     AS_REGISTER_BLOCK_SIZE_HIGH,
-				     upper_32_bits(*size));
+			  AS_REGISTER_BLOCK_SIZE_HIGH,
+			  upper_32_bits(*size));
 
 	res = as_talk_to_hardware(state,
-					     AS_COMMAND_ALLOCATE_BLOCK);
+				  AS_COMMAND_ALLOCATE_BLOCK);
 	if (!res) {
 		u64 low = as_read_register(state->io_registers,
 					   AS_REGISTER_BLOCK_OFFSET_LOW);
@@ -155,9 +142,9 @@ as_ioctl_allocate_block_locked_impl(struct as_device_state *state,
 		*offset = low | (high << 32);
 
 		low = as_read_register(state->io_registers,
-						  AS_REGISTER_BLOCK_SIZE_LOW);
+				       AS_REGISTER_BLOCK_SIZE_LOW);
 		high = as_read_register(state->io_registers,
-						   AS_REGISTER_BLOCK_SIZE_HIGH);
+					AS_REGISTER_BLOCK_SIZE_HIGH);
 		*size = low | (high << 32);
 	}
 
@@ -165,18 +152,16 @@ as_ioctl_allocate_block_locked_impl(struct as_device_state *state,
 }
 
 static long
-as_ioctl_unallocate_block_locked_impl(struct as_device_state *state,
-						 u64 offset)
+as_ioctl_unallocate_block_locked_impl(struct as_device_state *state, u64 offset)
 {
 	as_write_register(state->io_registers,
-				     AS_REGISTER_BLOCK_OFFSET_LOW,
-				     lower_32_bits(offset));
+			  AS_REGISTER_BLOCK_OFFSET_LOW,
+			  lower_32_bits(offset));
 	as_write_register(state->io_registers,
-				     AS_REGISTER_BLOCK_OFFSET_HIGH,
-				     upper_32_bits(offset));
+			  AS_REGISTER_BLOCK_OFFSET_HIGH,
+			  upper_32_bits(offset));
 
-	return as_talk_to_hardware(state,
-					      AS_COMMAND_DEALLOCATE_BLOCK);
+	return as_talk_to_hardware(state, AS_COMMAND_DEALLOCATE_BLOCK);
 }
 
 static int as_blocks_grow_capacity(int old_capacity)
@@ -225,7 +210,7 @@ as_blocks_insert(struct as_allocated_blocks *allocated_blocks,
 		allocated_blocks->blocks_capacity = new_capacity;
 	}
 
-	BUG_ON(blocks_size >= allocated_blocks->blocks_capacity);
+	WARN_ON(blocks_size >= allocated_blocks->blocks_capacity);
 
 	allocated_blocks->blocks[blocks_size] =
 		(struct as_block){ .offset = offset, .size = size };
@@ -236,8 +221,7 @@ as_blocks_insert(struct as_allocated_blocks *allocated_blocks,
 }
 
 static int
-as_blocks_remove(struct as_allocated_blocks *allocated_blocks,
-			    u64 offset)
+as_blocks_remove(struct as_allocated_blocks *allocated_blocks, u64 offset)
 {
 	long res = -ENXIO;
 	struct as_block *blocks;
@@ -248,10 +232,10 @@ as_blocks_remove(struct as_allocated_blocks *allocated_blocks,
 		return -ERESTARTSYS;
 
 	blocks = allocated_blocks->blocks;
-	BUG_ON(!blocks);
+	WARN_ON(!blocks);
 
 	blocks_size = allocated_blocks->blocks_size;
-	BUG_ON(blocks_size < 0);
+	WARN_ON(blocks_size < 0);
 
 	for (i = 0; i < blocks_size; ++i) {
 		if (offset == blocks[i].offset) {
@@ -272,10 +256,11 @@ as_blocks_remove(struct as_allocated_blocks *allocated_blocks,
 
 static int
 as_blocks_check_if_mine(struct as_allocated_blocks *allocated_blocks,
-				   u64 offset,
-				   u64 size)
+			u64 offset,
+			u64 size)
 {
-	int res = -ENXIO;
+	const u64 end = offset + size;
+	int res = -EPERM;
 	struct as_block *block;
 	int blocks_size;
 
@@ -283,14 +268,17 @@ as_blocks_check_if_mine(struct as_allocated_blocks *allocated_blocks,
 		return -ERESTARTSYS;
 
 	block = allocated_blocks->blocks;
-	BUG_ON(!block);
+	WARN_ON(!block);
 
 	blocks_size = allocated_blocks->blocks_size;
-	BUG_ON(blocks_size < 0);
+	WARN_ON(blocks_size < 0);
 
 	for (; blocks_size > 0; --blocks_size, ++block) {
-		if (block->offset == offset) {
-			res = (block->size >= size) ? 0 : -EPERM;
+		u64 block_offset = block->offset;
+		u64 block_end = block_offset + block->size;
+
+		if (offset >= block_offset && end <= block_end) {
+			res = 0;
 			break;
 		}
 	}
@@ -361,8 +349,8 @@ static int as_release(struct inode *inode, struct file *filp)
 }
 
 static int as_mmap_impl(struct as_device_state *state,
-				   size_t size,
-				   struct vm_area_struct *vma)
+			size_t size,
+			struct vm_area_struct *vma)
 {
 	unsigned long pfn = (state->address_area_phys_address >> PAGE_SHIFT) +
 		vma->vm_pgoff;
@@ -380,11 +368,11 @@ static int as_mmap(struct file *filp, struct vm_area_struct *vma)
 	size_t size = PAGE_ALIGN(vma->vm_end - vma->vm_start);
 	int res;
 
-	BUG_ON(!allocated_blocks);
+	WARN_ON(!allocated_blocks);
 
 	res = as_blocks_check_if_mine(allocated_blocks,
-						 vma->vm_pgoff << PAGE_SHIFT,
-						 size);
+				      vma->vm_pgoff << PAGE_SHIFT,
+				      size);
 
 	if (res)
 		return res;
@@ -414,8 +402,7 @@ static long as_ioctl_allocate_block_impl(
 }
 
 static void
-as_ioctl_unallocate_block_impl(struct as_device_state *state,
-					  u64 offset)
+as_ioctl_unallocate_block_impl(struct as_device_state *state, u64 offset)
 {
 	mutex_lock(&state->registers_lock);
 	WARN_ON(as_ioctl_unallocate_block_locked_impl(state, offset));
@@ -424,7 +411,7 @@ as_ioctl_unallocate_block_impl(struct as_device_state *state,
 
 static long
 as_ioctl_allocate_block(struct as_allocated_blocks *allocated_blocks,
-				   void __user *ptr)
+			void __user *ptr)
 {
 	long res;
 	struct as_device_state *state = allocated_blocks->state;
@@ -436,8 +423,8 @@ as_ioctl_allocate_block(struct as_allocated_blocks *allocated_blocks,
 	res = as_ioctl_allocate_block_impl(state, &request);
 	if (!res) {
 		res = as_blocks_insert(allocated_blocks,
-						  request.offset,
-						  request.size);
+				       request.offset,
+				       request.size);
 
 		if (res) {
 			as_ioctl_unallocate_block_impl(state, request.offset);
@@ -452,7 +439,7 @@ as_ioctl_allocate_block(struct as_allocated_blocks *allocated_blocks,
 
 static long
 as_ioctl_unallocate_block(struct as_allocated_blocks *allocated_blocks,
-				     void __user *ptr)
+			  void __user *ptr)
 {
 	long res;
 	u64 offset;
@@ -467,8 +454,7 @@ as_ioctl_unallocate_block(struct as_allocated_blocks *allocated_blocks,
 	return res;
 }
 
-static long as_ioctl(struct file *filp,
-				unsigned int cmd, unsigned long arg)
+static long as_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct as_allocated_blocks *allocated_blocks = filp->private_data;
 
@@ -482,7 +468,7 @@ static long as_ioctl(struct file *filp,
 						 (void __user *)arg);
 
 	default:
-		return -ENOSYS;
+		return -ENOTTY;
 	}
 }
 
@@ -499,15 +485,12 @@ static void __iomem __must_check *ioremap_pci_bar(struct pci_dev *dev,
 						  int bar_id)
 {
 	void __iomem *io;
-	unsigned long size;
-	unsigned long start = pci_resource_start(dev, bar_id);
-	unsigned long end = pci_resource_end(dev, bar_id);
+	unsigned long size = pci_resource_len(dev, bar_id);
 
-	if (end <= start)
+	if (!size)
 		return IOMEM_ERR_PTR(-ENXIO);
 
-	size = end - start;
-	io = ioremap(start, size);
+	io = ioremap(pci_resource_start(dev, bar_id), size);
 	if (!io)
 		return IOMEM_ERR_PTR(-ENOMEM);
 
@@ -519,43 +502,27 @@ static void __must_check *memremap_pci_bar(struct pci_dev *dev,
 					   unsigned long flags)
 {
 	void *mem;
-	unsigned long size;
-	unsigned long start = pci_resource_start(dev, bar_id);
-	unsigned long end = pci_resource_end(dev, bar_id);
+	unsigned long size = pci_resource_len(dev, bar_id);
 
-	if (end <= start)
+	if (!size)
 		return ERR_PTR(-ENXIO);
 
-	size = end - start;
-	mem = memremap(start, size, flags);
+	mem = memremap(pci_resource_start(dev, bar_id), size, flags);
 	if (!mem)
 		return ERR_PTR(-ENOMEM);
 
 	return mem;
 }
 
-static void
-as_pci_remove_from_devices(struct as_device_state *state)
+static void as_pci_clear_device(struct as_device_state *state)
 {
-	struct list_head *i;
+	struct as_driver_state *driver_state = state->driver_state;
 
-	mutex_lock(&state->driver_state->devices_lock);
-
-	list_for_each(i, &state->driver_state->devices) {
-		struct as_device_state *si =
-			list_entry(i, struct as_device_state, node);
-		if (state == si) {
-			list_del(i);
-			mutex_unlock(&state->driver_state->devices_lock);
-			return;
-		}
-	}
-
-	BUG();
+	WARN_ON(!driver_state->device_state);
+	driver_state->device_state = NULL;
 }
 
-static irqreturn_t __must_check
-as_interrupt_impl(struct as_device_state *state)
+static irqreturn_t __must_check as_interrupt_impl(struct as_device_state *state)
 {
 	state->hw_done = 1;
 	wake_up_interruptible(&state->wake_queue);
@@ -575,14 +542,14 @@ static void fill_miscdevice(struct miscdevice *miscdev)
 	memset(miscdev, 0, sizeof(*miscdev));
 
 	miscdev->minor = MISC_DYNAMIC_MINOR;
-	miscdev->name = AS_DEVICE_NAME;
+	miscdev->name = GOLDFISH_ADDRESS_SPACE_DEVICE_NAME;
 	miscdev->fops = &userspace_file_operations;
 }
 
 static int __must_check
 create_as_device(struct pci_dev *dev,
-			    const struct pci_device_id *id,
-			    struct as_driver_state *driver_state)
+		 const struct pci_device_id *id,
+		 struct as_driver_state *driver_state)
 {
 	int res;
 	struct as_device_state *state;
@@ -643,8 +610,8 @@ create_as_device(struct pci_dev *dev,
 		goto out_memunmap;
 
 	as_write_register(state->io_registers,
-				     AS_REGISTER_GUEST_PAGE_SIZE,
-				     PAGE_SIZE);
+			  AS_REGISTER_GUEST_PAGE_SIZE,
+			  PAGE_SIZE);
 
 	state->magic = AS_MAGIC_U32;
 	state->dev = dev;
@@ -652,7 +619,7 @@ create_as_device(struct pci_dev *dev,
 	mutex_init(&state->registers_lock);
 	init_waitqueue_head(&state->wake_queue);
 
-	list_add(&state->node, &driver_state->devices);
+	driver_state->device_state = state;
 
 	pci_set_drvdata(dev, state);
 	return 0;
@@ -673,10 +640,9 @@ out_free_device_state:
 	return res;
 }
 
-static void
-destroy_as_device(struct as_device_state *state)
+static void as_pci_destroy_device(struct as_device_state *state)
 {
-	as_pci_remove_from_devices(state);
+	as_pci_clear_device(state);
 	free_irq(state->dev->irq, state);
 	memunmap(state->address_area);
 	iounmap(state->io_registers);
@@ -688,8 +654,8 @@ destroy_as_device(struct as_device_state *state)
 
 static int __must_check
 as_pci_probe_impl(struct pci_dev *dev,
-			     const struct pci_device_id *id,
-			     struct as_driver_state *driver_state)
+		  const struct pci_device_id *id,
+		  struct as_driver_state *driver_state)
 {
 	int res;
 	u8 hardware_revision;
@@ -724,51 +690,45 @@ static void as_pci_remove(struct pci_dev *dev)
 {
 	struct as_device_state *state = pci_get_drvdata(dev);
 
-	destroy_as_device(state);
+	as_pci_destroy_device(state);
 	pci_disable_device(dev);
 }
 
 static const struct pci_device_id as_pci_tbl[] = {
-	{ PCI_DEVICE(AS_PCI_VENDOR_ID,
-		     AS_PCI_DEVICE_ID), },
+	{ PCI_DEVICE(AS_PCI_VENDOR_ID, AS_PCI_DEVICE_ID), },
 	{ }
 };
 MODULE_DEVICE_TABLE(pci, as_pci_tbl);
 
-static int as_pci_probe(struct pci_dev *dev,
-				   const struct pci_device_id *id);
+static int as_pci_probe(struct pci_dev *dev, const struct pci_device_id *id);
 
 static void __init fill_pci_driver(struct pci_driver *pci)
 {
-	pci->name = AS_DEVICE_NAME;
+	pci->name = GOLDFISH_ADDRESS_SPACE_DEVICE_NAME;
 	pci->id_table = as_pci_tbl;
 	pci->probe = &as_pci_probe;
 	pci->remove = &as_pci_remove;
 	pci->shutdown = &as_pci_remove;
 }
 
-static int __must_check __init
-init_as_impl(struct as_driver_state *state)
+static int __must_check __init init_as_impl(struct as_driver_state *state)
 {
-	INIT_LIST_HEAD(&state->devices);
-	mutex_init(&state->devices_lock);
+	state->device_state = NULL;
 	fill_pci_driver(&state->pci);
 
 	return pci_register_driver(&state->pci);
 }
 
-static void __exit
-exit_as_impl(struct as_driver_state *state)
+static void __exit exit_as_impl(struct as_driver_state *state)
 {
-	BUG_ON(!list_empty(&state->devices));
+	WARN_ON(state->device_state);
 
 	pci_unregister_driver(&state->pci);
 }
 
 static struct as_driver_state g_driver_state;
 
-static int as_pci_probe(struct pci_dev *dev,
-				   const struct pci_device_id *id)
+static int as_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
 	return as_pci_probe_impl(dev, id, &g_driver_state);
 }
