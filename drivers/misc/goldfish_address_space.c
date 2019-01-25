@@ -6,8 +6,6 @@
 #include <linux/wait.h>
 #include <linux/fs.h>
 #include <linux/io.h>
-#include <linux/interrupt.h>
-#include <linux/irqreturn.h>
 #include <linux/uaccess.h>
 #include <linux/miscdevice.h>
 
@@ -112,11 +110,9 @@ static u32 as_read_register(void __iomem *registers, int offset)
 static int
 as_talk_to_hardware(struct as_device_state *state, enum as_command_id cmd)
 {
-	state->hw_done = 0;
+	state->hw_done = 1;
 	as_write_register(state->io_registers, AS_REGISTER_COMMAND, cmd);
-	wait_event(state->wake_queue, state->hw_done);
-	return -as_read_register(state->io_registers,
-				 AS_REGISTER_STATUS);
+	return -as_read_register(state->io_registers, AS_REGISTER_STATUS);
 }
 
 static long
@@ -457,19 +453,24 @@ as_ioctl_unallocate_block(struct as_allocated_blocks *allocated_blocks,
 static long as_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct as_allocated_blocks *allocated_blocks = filp->private_data;
+    long res = -ENOTTY;
 
 	switch (cmd) {
 	case GOLDFISH_ADDRESS_SPACE_IOCTL_ALLOCATE_BLOCK:
-		return as_ioctl_allocate_block(allocated_blocks,
+		res = as_ioctl_allocate_block(allocated_blocks,
 					       (void __user *)arg);
 
+        break;
 	case GOLDFISH_ADDRESS_SPACE_IOCTL_DEALLOCATE_BLOCK:
-		return as_ioctl_unallocate_block(allocated_blocks,
+		res = as_ioctl_unallocate_block(allocated_blocks,
 						 (void __user *)arg);
+        break;
 
-	default:
-		return -ENOTTY;
+    default:
+        break;
 	}
+
+    return res;
 }
 
 static const struct file_operations userspace_file_operations = {
@@ -520,21 +521,6 @@ static void as_pci_clear_device(struct as_device_state *state)
 
 	WARN_ON(!driver_state->device_state);
 	driver_state->device_state = NULL;
-}
-
-static irqreturn_t __must_check as_interrupt_impl(struct as_device_state *state)
-{
-	state->hw_done = 1;
-	wake_up_interruptible(&state->wake_queue);
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t as_interrupt(int irq, void *dev_id)
-{
-	struct as_device_state *state = dev_id;
-
-	return (state->magic == AS_MAGIC_U32)
-		? as_interrupt_impl(state) : IRQ_NONE;
 }
 
 static void fill_miscdevice(struct miscdevice *miscdev)
@@ -603,12 +589,6 @@ create_as_device(struct pci_dev *dev,
 	state->address_area_phys_address =
 		pci_resource_start(dev, AS_PCI_AREA_BAR_ID);
 
-	res = request_irq(dev->irq,
-			  as_interrupt, IRQF_SHARED,
-			  KBUILD_MODNAME, state);
-	if (res)
-		goto out_memunmap;
-
 	as_write_register(state->io_registers,
 			  AS_REGISTER_GUEST_PAGE_SIZE,
 			  PAGE_SIZE);
@@ -624,9 +604,8 @@ create_as_device(struct pci_dev *dev,
 	pci_set_drvdata(dev, state);
 	return 0;
 
-out_memunmap:
-	memunmap(state->address_area);
 out_iounmap:
+	memunmap(state->address_area);
 	iounmap(state->io_registers);
 out_misc_deregister:
 	misc_deregister(&state->miscdevice);
@@ -643,7 +622,6 @@ out_free_device_state:
 static void as_pci_destroy_device(struct as_device_state *state)
 {
 	as_pci_clear_device(state);
-	free_irq(state->dev->irq, state);
 	memunmap(state->address_area);
 	iounmap(state->io_registers);
 	misc_deregister(&state->miscdevice);
