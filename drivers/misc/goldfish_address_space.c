@@ -147,7 +147,7 @@ as_ping_impl(struct as_device_state *state, u32 handle)
 	as_write_register(state->io_registers, AS_REGISTER_PING, handle);
 }
 
-	static long
+static long
 as_ioctl_allocate_block_locked_impl(struct as_device_state *state,
 				    u64 *size, u64 *offset)
 {
@@ -317,8 +317,6 @@ as_blocks_check_if_mine(struct as_allocated_blocks *allocated_blocks,
 
 static int as_open(struct inode *inode, struct file *filp)
 {
-	AS_DPRINT("Start");
-
 	struct as_file_state *file_state;
 	struct as_device_state *device_state;
 	struct goldfish_address_space_ping *ping_info;
@@ -347,8 +345,8 @@ static int as_open(struct inode *inode, struct file *filp)
 
 	file_state->device_state =
 		container_of(filp->private_data,
-				struct as_device_state,
-				miscdevice);
+			     struct as_device_state,
+			     miscdevice);
 	device_state = file_state->device_state;
 
 	file_state->allocated_blocks.blocks =
@@ -396,11 +394,11 @@ static int as_open(struct inode *inode, struct file *filp)
 	as_write_register(
 		device_state->io_registers,
 		AS_REGISTER_PING_INFO_ADDR_LOW,
-		(u32)ping_info_phys);
+		lower_32_bits(ping_info_phys));
 	as_write_register(
 		device_state->io_registers,
 		AS_REGISTER_PING_INFO_ADDR_HIGH,
-		(u32)(ping_info_phys >> 32));
+		upper_32_bits(ping_info_phys));
 	AS_DPRINT("Do tell ping info addr");
 	as_write_register(
 		device_state->io_registers,
@@ -539,10 +537,10 @@ as_ioctl_unallocate_block_impl(struct as_device_state *state, u64 offset)
 	mutex_unlock(&state->registers_lock);
 }
 
-	static long
+static long
 as_ioctl_allocate_block(struct as_allocated_blocks *allocated_blocks,
-struct as_device_state* state,
-		void __user *ptr)
+			struct as_device_state* state,
+			void __user *ptr)
 {
 	long res;
 	struct goldfish_address_space_allocate_block request;
@@ -567,10 +565,10 @@ struct as_device_state* state,
 	return res;
 }
 
-	static long
+static long
 as_ioctl_unallocate_block(struct as_allocated_blocks *allocated_blocks,
-struct as_device_state* state,
-		void __user *ptr)
+			  struct as_device_state* state,
+			  void __user *ptr)
 {
 	long res;
 	u64 offset;
@@ -585,11 +583,11 @@ struct as_device_state* state,
 	return res;
 }
 
-	static long
+static long
 as_ioctl_ping(struct goldfish_address_space_ping *ping_info,
-		struct as_device_state *state,
-		u32 handle,
-		void __user *ptr)
+	      struct as_device_state *state,
+	      u32 handle,
+	      void __user *ptr)
 {
 	if (copy_from_user(ping_info, ptr, sizeof(struct goldfish_address_space_ping)))
 		return -EFAULT;
@@ -613,20 +611,20 @@ static long as_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	switch (cmd) {
 	case GOLDFISH_ADDRESS_SPACE_IOCTL_ALLOCATE_BLOCK:
 		res = as_ioctl_allocate_block(&file_state->allocated_blocks,
-		file_state->device_state,
-						   (void __user *)arg);
+					      file_state->device_state,
+					      (void __user *)arg);
 
 		break;
 	case GOLDFISH_ADDRESS_SPACE_IOCTL_DEALLOCATE_BLOCK:
 		res = as_ioctl_unallocate_block(&file_state->allocated_blocks,
-		file_state->device_state,
-						 (void __user *)arg);
+						file_state->device_state,
+						(void __user *)arg);
 		break;
 	case GOLDFISH_ADDRESS_SPACE_IOCTL_PING:
 		res = as_ioctl_ping(file_state->ping_info,
-						file_state->device_state,
-						file_state->handle,
-						 (void __user *)arg);
+				    file_state->device_state,
+				    file_state->handle,
+				    (void __user *)arg);
 		break;
 
 	default:
