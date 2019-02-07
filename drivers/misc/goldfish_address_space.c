@@ -600,6 +600,9 @@ as_ioctl_ping(struct goldfish_address_space_ping *ping_info,
 	as_ping_impl(state, handle);
 	mutex_unlock(&state->registers_lock);
 
+	if (copy_to_user(ptr, ping_info, sizeof(struct goldfish_address_space_ping)))
+		return -EFAULT;
+
 	return 0;
 }
 
