@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (C) 2012 Intel, Inc.
  * Copyright (C) 2013 Intel, Inc.
@@ -46,13 +47,21 @@
  * exchange is properly mapped during a transfer.
  */
 
-#include <linux/device.h>
-#include <linux/dma-mapping.h>
-#include <linux/platform_device.h>
-#include <linux/types.h>
+#include <linux/interrupt.h>
 #include <linux/kernel.h>
+#include <linux/spinlock.h>
+#include <linux/miscdevice.h>
+#include <linux/platform_device.h>
+#include <linux/poll.h>
+#include <linux/sched.h>
+#include <linux/bitops.h>
+#include <linux/slab.h>
+#include <linux/io.h>
+#include <linux/dma-mapping.h>
+#include <linux/mm.h>
 #include <linux/bug.h>
 #include <uapi/linux/goldfish/goldfish_dma.h>
+#include "goldfish_pipe_qemu.h"
 #include "goldfish_pipe.h"
 
 /*
@@ -61,80 +70,11 @@
  * Notes:
  *	version 2 was an intermediate release and isn't supported anymore.
  *	version 3 is goldfish_pipe_v2 without DMA support.
-	version 4 (current) is goldfish_pipe_v2 with DMA support.
+ *	version 4 (current) is goldfish_pipe_v2 with DMA support.
  */
 enum {
 	PIPE_DRIVER_VERSION = 4,
 	PIPE_CURRENT_DEVICE_VERSION = 2
-};
-
-/* IMPORTANT: The following constants must match the ones used and defined
- * in external/qemu/hw/goldfish_pipe.c in the Android source tree.
- */
-
-/* List of bitflags returned in status of CMD_POLL command */
-enum PipePollFlags {
-	PIPE_POLL_IN	= BIT(0),
-	PIPE_POLL_OUT	= BIT(1),
-	PIPE_POLL_HUP	= BIT(2),
-};
-
-/*
- * Possible status values used to signal errors - see
- * goldfish_pipe_error_convert
- */
-enum PipeErrors {
-	PIPE_ERROR_INVAL  = -1,
-	PIPE_ERROR_AGAIN  = -2,
-	PIPE_ERROR_NOMEM  = -3,
-	PIPE_ERROR_IO     = -4
-};
-
-/* Bit-flags used to signal events from the emulator */
-enum PipeWakeFlags {
-	PIPE_WAKE_CLOSED = BIT(0),  /* emulator closed pipe */
-	PIPE_WAKE_READ   = BIT(1),  /* pipe can now be read from */
-	PIPE_WAKE_WRITE  = BIT(2),  /* pipe can now be written to */
-};
-
-/* Bit flags for the 'flags' field */
-enum PipeFlagsBits {
-	BIT_CLOSED_ON_HOST = 0,  /* pipe closed by host */
-	BIT_WAKE_ON_WRITE  = 1,  /* want to be woken on writes */
-	BIT_WAKE_ON_READ   = 2,  /* want to be woken on reads */
-};
-
-enum PipeRegs {
-	PIPE_REG_CMD = 0,
-
-	PIPE_REG_SIGNAL_BUFFER_HIGH = 4,
-	PIPE_REG_SIGNAL_BUFFER = 8,
-	PIPE_REG_SIGNAL_BUFFER_COUNT = 12,
-
-	PIPE_REG_OPEN_BUFFER_HIGH = 20,
-	PIPE_REG_OPEN_BUFFER = 24,
-
-	PIPE_REG_VERSION = 36,
-
-	PIPE_REG_GET_SIGNALLED = 48,
-};
-
-enum PipeCmdCode {
-	PIPE_CMD_OPEN = 1,	/* to be used by the pipe device itself */
-	PIPE_CMD_CLOSE,
-	PIPE_CMD_POLL,
-	PIPE_CMD_WRITE,
-	PIPE_CMD_WAKE_ON_WRITE,
-	PIPE_CMD_READ,
-	PIPE_CMD_WAKE_ON_READ,
-
-	/*
-	 * TODO(zyy): implement a deferred read/write execution to allow
-	 * parallel processing of pipe operations on the host.
-	 */
-	PIPE_CMD_WAKE_ON_DONE_IO,
-	PIPE_CMD_DMA_HOST_MAP,
-	PIPE_CMD_DMA_HOST_UNMAP,
 };
 
 enum {
@@ -146,8 +86,9 @@ enum {
 };
 
 struct goldfish_pipe_dev;
-struct goldfish_pipe;
-struct goldfish_pipe_command;
+
+static int goldfish_pipe_device_deinit(void *raw_dev,
+				       struct platform_device *pdev);
 
 /* A per-pipe command structure, shared with the host */
 struct goldfish_pipe_command {
@@ -217,22 +158,22 @@ struct goldfish_pipe {
 	/* pipe ID - index into goldfish_pipe_dev::pipes array */
 	u32 id;
 
-	/* The wake flags pipe is waiting for.
-	 * Note: not protected with any lock, uses atomic operations and
-	 * barriers to make it thread-safe.
+	/* The wake flags pipe is waiting for
+	 * Note: not protected with any lock, uses atomic operations
+	 *  and barriers to make it thread-safe.
 	 */
 	unsigned long flags;
 
 	/* wake flags host have signalled,
-	 * protected by goldfish_pipe_dev::lock
+	 *  - protected by goldfish_pipe_dev::lock
 	 */
 	unsigned long signalled_flags;
 
 	/* A pointer to command buffer */
 	struct goldfish_pipe_command *command_buffer;
 
-	/* doubly linked list of signalled pipes,
-	 * protected by goldfish_pipe_dev::lock
+	/* doubly linked list of signalled pipes, protected by
+	 * goldfish_pipe_dev::lock
 	 */
 	struct goldfish_pipe *prev_signalled;
 	struct goldfish_pipe *next_signalled;
@@ -240,27 +181,85 @@ struct goldfish_pipe {
 	/*
 	 * A pipe's own lock. Protects the following:
 	 *  - *command_buffer - makes sure a command can safely write its
-	 *      parameters to the host and read the results back.
+	 *    parameters to the host and read the results back.
 	 */
 	struct mutex lock;
 
 	/* A wake queue for sleeping until host signals an event */
 	wait_queue_head_t wake_queue;
+
 	/* Pointer to the parent goldfish_pipe_dev instance */
 	struct goldfish_pipe_dev *dev;
+
+	/* A buffer of pages, too large to fit into a stack frame */
+	struct page *pages[MAX_BUFFERS_PER_COMMAND];
+
 	/* Holds information about reserved DMA region for this pipe */
 	struct goldfish_dma_context *dma;
 };
 
-struct goldfish_pipe_dev goldfish_pipe_dev;
+/* The global driver data. Holds a reference to the i/o page used to
+ * communicate with the emulator, and a wake queue for blocked tasks
+ * waiting to be awoken.
+ */
+struct goldfish_pipe_dev {
+	/* Needed for 'remove' */
+	struct goldfish_pipe_dev_base super;
 
-static int goldfish_pipe_cmd_locked(
-	struct goldfish_pipe *pipe, enum PipeCmdCode cmd)
+	/*
+	 * Global device spinlock. Protects the following members:
+	 *  - pipes, pipes_capacity
+	 *  - [*pipes, *pipes + pipes_capacity) - array data
+	 *  - first_signalled_pipe,
+	 *      goldfish_pipe::prev_signalled,
+	 *      goldfish_pipe::next_signalled,
+	 *      goldfish_pipe::signalled_flags - all singnalled-related fields,
+	 *                                       in all allocated pipes
+	 *  - open_command_params - PIPE_CMD_OPEN-related buffers
+	 *
+	 * It looks like a lot of different fields, but the trick is that
+	 * the only operation that happens often is the signalled pipes array
+	 * manipulation. That's why it's OK for now to keep the rest of the
+	 * fields under the same lock. If we notice too much contention because
+	 * of PIPE_CMD_OPEN, then we should add a separate lock there.
+	 */
+	spinlock_t lock;
+
+	/*
+	 * Array of the pipes of |pipes_capacity| elements,
+	 * indexed by goldfish_pipe::id
+	 */
+	struct goldfish_pipe **pipes;
+	u32 pipes_capacity;
+
+	/* Pointers to the buffers host uses for interaction with this driver */
+	struct goldfish_pipe_dev_buffers *buffers;
+
+	/* Head of a doubly linked list of signalled pipes */
+	struct goldfish_pipe *first_signalled_pipe;
+
+	/* ptr to platform device's device struct */
+	struct device *pdev_dev;
+
+	/* Some device-specific data */
+	unsigned char __iomem *base;
+
+	/* an irq tasklet to run goldfish_interrupt_task */
+	struct tasklet_struct irq_tasklet;
+
+	struct miscdevice miscdev;
+
+	/* DMA info */
+	size_t dma_alloc_total;
+};
+
+static int goldfish_pipe_cmd_locked(struct goldfish_pipe *pipe,
+				    enum PipeCmdCode cmd)
 {
 	pipe->command_buffer->cmd = cmd;
 	/* failure by default */
 	pipe->command_buffer->status = PIPE_ERROR_INVAL;
-	writel(pipe->id, pipe->dev->base + PIPE_REG_CMD);
+	writel(pipe->id, pipe->dev->base + PIPE_V2_REG_CMD);
 	return pipe->command_buffer->status;
 }
 
@@ -270,16 +269,14 @@ static int goldfish_pipe_cmd(struct goldfish_pipe *pipe, enum PipeCmdCode cmd)
 
 	if (mutex_lock_interruptible(&pipe->lock))
 		return PIPE_ERROR_IO;
-
 	status = goldfish_pipe_cmd_locked(pipe, cmd);
-
 	mutex_unlock(&pipe->lock);
 	return status;
 }
 
 /*
  * This function converts an error code returned by the emulator through
- * the PIPE_REG_STATUS i/o register into a valid negative errno value.
+ * the PIPE_V2_REG_STATUS i/o register into a valid negative errno value.
  */
 static int goldfish_pipe_error_convert(int status)
 {
@@ -295,10 +292,12 @@ static int goldfish_pipe_error_convert(int status)
 	}
 }
 
-static int pin_user_pages(unsigned long first_page, unsigned long last_page,
-	unsigned int last_page_size, int is_write,
-	struct page *pages[MAX_BUFFERS_PER_COMMAND],
-	unsigned int *iter_last_page_size)
+static int pin_user_pages(unsigned long first_page,
+			  unsigned long last_page,
+			  unsigned int last_page_size,
+			  int is_write,
+			  struct page *pages[MAX_BUFFERS_PER_COMMAND],
+			  unsigned int *iter_last_page_size)
 {
 	int ret;
 	int requested_pages = ((last_page - first_page) >> PAGE_SHIFT) + 1;
@@ -310,36 +309,38 @@ static int pin_user_pages(unsigned long first_page, unsigned long last_page,
 		*iter_last_page_size = last_page_size;
 	}
 
-	ret = get_user_pages_fast(
-			first_page, requested_pages, !is_write, pages);
+	ret = get_user_pages_fast(first_page, requested_pages, !is_write,
+				  pages);
 	if (ret <= 0)
 		return -EFAULT;
 	if (ret < requested_pages)
 		*iter_last_page_size = PAGE_SIZE;
-	return ret;
 
+	return ret;
 }
 
 static void release_user_pages(struct page **pages, int pages_count,
-	int is_write, s32 consumed_size)
+			       int is_write, s32 consumed_size)
 {
 	int i;
 
 	for (i = 0; i < pages_count; i++) {
 		if (!is_write && consumed_size > 0)
 			set_page_dirty(pages[i]);
-
 		put_page(pages[i]);
 	}
 }
 
 /* Populate the call parameters, merging adjacent pages together */
-static void populate_rw_params(
-	struct page **pages, int pages_count,
-	unsigned long address, unsigned long address_end,
-	unsigned long first_page, unsigned long last_page,
-	unsigned int iter_last_page_size, int is_write,
-	struct goldfish_pipe_command *command)
+static void populate_rw_params(struct page **pages,
+			       int pages_count,
+			       unsigned long address,
+			       unsigned long address_end,
+			       unsigned long first_page,
+			       unsigned long last_page,
+			       unsigned int iter_last_page_size,
+			       int is_write,
+			       struct goldfish_pipe_command *command)
 {
 	/*
 	 * Process the first page separately - it's the only page that
@@ -358,7 +359,6 @@ static void populate_rw_params(
 		xaddr = page_to_phys(pages[i]);
 		size_on_page = (i == pages_count - 1) ?
 			iter_last_page_size : PAGE_SIZE;
-
 		if (xaddr == xaddr_prev + PAGE_SIZE) {
 			command->rw_params.sizes[buffer_idx] += size_on_page;
 		} else {
@@ -372,54 +372,59 @@ static void populate_rw_params(
 }
 
 static int transfer_max_buffers(struct goldfish_pipe *pipe,
-	unsigned long address, unsigned long address_end, int is_write,
-	unsigned long last_page, unsigned int last_page_size,
-	s32 *consumed_size, int *status)
+				unsigned long address,
+				unsigned long address_end,
+				int is_write,
+				unsigned long last_page,
+				unsigned int last_page_size,
+				s32 *consumed_size,
+				int *status)
 {
-	struct page *pages[MAX_BUFFERS_PER_COMMAND];
 	unsigned long first_page = address & PAGE_MASK;
 	unsigned int iter_last_page_size;
-	int pages_count = pin_user_pages(first_page, last_page,
-			last_page_size, is_write,
-			pages, &iter_last_page_size);
-	if (pages_count < 0)
-		return pages_count;
+	int pages_count;
 
 	/* Serialize access to the pipe command buffers */
 	if (mutex_lock_interruptible(&pipe->lock))
 		return -ERESTARTSYS;
 
-	populate_rw_params(pages, pages_count, address, address_end,
-		first_page, last_page, iter_last_page_size, is_write,
-		pipe->command_buffer);
+	pages_count = pin_user_pages(first_page, last_page,
+				     last_page_size, is_write,
+				     pipe->pages, &iter_last_page_size);
+	if (pages_count < 0) {
+		mutex_unlock(&pipe->lock);
+		return pages_count;
+	}
+
+	populate_rw_params(pipe->pages, pages_count, address, address_end,
+			   first_page, last_page, iter_last_page_size, is_write,
+			   pipe->command_buffer);
 
 	/* Transfer the data */
-	*status = goldfish_pipe_cmd_locked(
-		pipe,
-		is_write ? PIPE_CMD_WRITE : PIPE_CMD_READ);
+	*status = goldfish_pipe_cmd_locked(pipe,
+				is_write ? PIPE_CMD_WRITE : PIPE_CMD_READ);
 
 	*consumed_size = pipe->command_buffer->rw_params.consumed_size;
 
-	mutex_unlock(&pipe->lock);
+	release_user_pages(pipe->pages, pages_count, is_write, *consumed_size);
 
-	release_user_pages(pages, pages_count, is_write, *consumed_size);
+	mutex_unlock(&pipe->lock);
 	return 0;
 }
 
 static int wait_for_host_signal(struct goldfish_pipe *pipe, int is_write)
 {
-	u32 wakeBit = is_write ? BIT_WAKE_ON_WRITE : BIT_WAKE_ON_READ;
-	u32 cmdBit = is_write ? PIPE_CMD_WAKE_ON_WRITE : PIPE_CMD_WAKE_ON_READ;
+	u32 wake_bit = is_write ? BIT_WAKE_ON_WRITE : BIT_WAKE_ON_READ;
 
-	set_bit(wakeBit, &pipe->flags);
+	set_bit(wake_bit, &pipe->flags);
 
 	/* Tell the emulator we're going to wait for a wake event */
-	goldfish_pipe_cmd(pipe, cmdBit);
+	goldfish_pipe_cmd(pipe,
+		is_write ? PIPE_CMD_WAKE_ON_WRITE : PIPE_CMD_WAKE_ON_READ);
 
-	while (test_bit(wakeBit, &pipe->flags)) {
-		if (wait_event_interruptible(
-				pipe->wake_queue,
-				!test_bit(wakeBit, &pipe->flags)))
+	while (test_bit(wake_bit, &pipe->flags)) {
+		if (wait_event_interruptible(pipe->wake_queue,
+					     !test_bit(wake_bit, &pipe->flags)))
 			return -ERESTARTSYS;
 
 		if (test_bit(BIT_CLOSED_ON_HOST, &pipe->flags))
@@ -430,13 +435,14 @@ static int wait_for_host_signal(struct goldfish_pipe *pipe, int is_write)
 }
 
 static ssize_t goldfish_pipe_read_write(struct file *filp,
-	char __user *buffer, size_t bufflen, int is_write)
+					char __user *buffer,
+					size_t bufflen,
+					int is_write)
 {
 	struct goldfish_pipe *pipe = filp->private_data;
 	int count = 0, ret = -EINVAL;
 	unsigned long address, address_end, last_page;
 	unsigned int last_page_size;
-	struct device *pdev_dev;
 
 	/* If the emulator already closed the pipe, no need to go further */
 	if (unlikely(test_bit(BIT_CLOSED_ON_HOST, &pipe->flags)))
@@ -446,7 +452,7 @@ static ssize_t goldfish_pipe_read_write(struct file *filp,
 		return 0;
 	/* Check the buffer range for access */
 	if (unlikely(!access_ok(is_write ? VERIFY_WRITE : VERIFY_READ,
-			buffer, bufflen)))
+				buffer, bufflen)))
 		return -EFAULT;
 
 	address = (unsigned long)buffer;
@@ -454,20 +460,19 @@ static ssize_t goldfish_pipe_read_write(struct file *filp,
 	last_page = (address_end - 1) & PAGE_MASK;
 	last_page_size = ((address_end - 1) & ~PAGE_MASK) + 1;
 
-	pdev_dev = pipe->dev->pdev_dev;
-
 	while (address < address_end) {
 		s32 consumed_size;
 		int status;
 
 		ret = transfer_max_buffers(pipe, address, address_end, is_write,
-			last_page, last_page_size, &consumed_size, &status);
+					   last_page, last_page_size,
+					   &consumed_size, &status);
 		if (ret < 0)
 			break;
 
 		if (consumed_size > 0) {
-			/* No matter what's the status, we've transfered
-			 * something
+			/* No matter what's the status, we've transferred
+			 * something.
 			 */
 			count += consumed_size;
 			address += consumed_size;
@@ -481,14 +486,14 @@ static ssize_t goldfish_pipe_read_write(struct file *filp,
 		}
 		if (count > 0) {
 			/*
-			 * An error occured, but we already transfered
+			 * An error occurred, but we already transferred
 			 * something on one of the previous iterations.
 			 * Just return what we already copied and log this
 			 * err.
 			 */
 			if (status != PIPE_ERROR_AGAIN)
-				dev_err_ratelimited(pdev_dev,
-					"goldfish_pipe: backend error %d on %s\n",
+				dev_err_ratelimited(pipe->dev->pdev_dev,
+					"backend error %d on %s\n",
 					status, is_write ? "write" : "read");
 			break;
 		}
@@ -497,8 +502,8 @@ static ssize_t goldfish_pipe_read_write(struct file *filp,
 		 * If the error is not PIPE_ERROR_AGAIN, or if we are in
 		 * non-blocking mode, just return the error code.
 		 */
-		if (status != PIPE_ERROR_AGAIN
-			|| (filp->f_flags & O_NONBLOCK) != 0) {
+		if (status != PIPE_ERROR_AGAIN ||
+			(filp->f_flags & O_NONBLOCK) != 0) {
 			ret = goldfish_pipe_error_convert(status);
 			break;
 		}
@@ -514,19 +519,21 @@ static ssize_t goldfish_pipe_read_write(struct file *filp,
 }
 
 static ssize_t goldfish_pipe_read(struct file *filp, char __user *buffer,
-				size_t bufflen, loff_t *ppos)
+				  size_t bufflen, loff_t *ppos)
 {
 	return goldfish_pipe_read_write(filp, buffer, bufflen,
-		/* is_write */ 0);
+					/* is_write */ 0);
 }
 
 static ssize_t goldfish_pipe_write(struct file *filp,
-				const char __user *buffer, size_t bufflen,
-				loff_t *ppos)
+				   const char __user *buffer, size_t bufflen,
+				   loff_t *ppos)
 {
-	return goldfish_pipe_read_write(filp,
-			/* cast away the const */(char __user *)buffer, bufflen,
-			/* is_write */ 1);
+	/* cast away the const */
+	char __user *no_const_buffer = (char __user *)buffer;
+
+	return goldfish_pipe_read_write(filp, no_const_buffer, bufflen,
+					/* is_write */ 1);
 }
 
 static unsigned int goldfish_pipe_poll(struct file *filp, poll_table *wait)
@@ -554,30 +561,29 @@ static unsigned int goldfish_pipe_poll(struct file *filp, poll_table *wait)
 }
 
 static void signalled_pipes_add_locked(struct goldfish_pipe_dev *dev,
-	u32 id, u32 flags)
+				       u32 id, u32 flags)
 {
 	struct goldfish_pipe *pipe;
 
-	if (id >= dev->pipes_capacity)
-		return; /* ignore this id, should never happen */
+	if (WARN_ON(id >= dev->pipes_capacity))
+		return;
 
 	pipe = dev->pipes[id];
 	if (!pipe)
 		return;
 	pipe->signalled_flags |= flags;
 
-	if (pipe->prev_signalled || pipe->next_signalled
-		|| dev->first_signalled_pipe == pipe)
+	if (pipe->prev_signalled || pipe->next_signalled ||
+		dev->first_signalled_pipe == pipe)
 		return;	/* already in the list */
 	pipe->next_signalled = dev->first_signalled_pipe;
 	if (dev->first_signalled_pipe)
 		dev->first_signalled_pipe->prev_signalled = pipe;
-
 	dev->first_signalled_pipe = pipe;
 }
 
 static void signalled_pipes_remove_locked(struct goldfish_pipe_dev *dev,
-	struct goldfish_pipe *pipe)
+					  struct goldfish_pipe *pipe)
 {
 	if (pipe->prev_signalled)
 		pipe->prev_signalled->next_signalled = pipe->next_signalled;
@@ -590,8 +596,7 @@ static void signalled_pipes_remove_locked(struct goldfish_pipe_dev *dev,
 }
 
 static struct goldfish_pipe *signalled_pipes_pop_front(
-		struct goldfish_pipe_dev *dev,
-		int *wakes)
+		struct goldfish_pipe_dev *dev, int *wakes)
 {
 	struct goldfish_pipe *pipe;
 	unsigned long flags;
@@ -602,9 +607,11 @@ static struct goldfish_pipe *signalled_pipes_pop_front(
 	if (pipe) {
 		*wakes = pipe->signalled_flags;
 		pipe->signalled_flags = 0;
-		/* This is an optimized version of
-		 * signalled_pipes_remove_locked() - we want to make it as fast
-		 * as possible to wake the sleeping pipe operations faster.
+		/*
+		 * This is an optimized version of
+		 * signalled_pipes_remove_locked()
+		 * - We want to make it as fast as possible to
+		 * wake the sleeping pipe operations faster.
 		 */
 		dev->first_signalled_pipe = pipe->next_signalled;
 		if (dev->first_signalled_pipe)
@@ -616,14 +623,14 @@ static struct goldfish_pipe *signalled_pipes_pop_front(
 	return pipe;
 }
 
-static void goldfish_interrupt_task(unsigned long unused)
+static void goldfish_interrupt_task(unsigned long dev_addr)
 {
 	/* Iterate over the signalled pipes and wake them one by one */
+	struct goldfish_pipe_dev *dev = (struct goldfish_pipe_dev *)dev_addr;
 	struct goldfish_pipe *pipe;
 	int wakes;
 
-	while ((pipe = signalled_pipes_pop_front(&goldfish_pipe_dev, &wakes)) !=
-			NULL) {
+	while ((pipe = signalled_pipes_pop_front(dev, &wakes)) != NULL) {
 		if (wakes & PIPE_WAKE_CLOSED) {
 			pipe->flags = 1 << BIT_CLOSED_ON_HOST;
 		} else {
@@ -639,7 +646,6 @@ static void goldfish_interrupt_task(unsigned long unused)
 		wake_up_interruptible(&pipe->wake_queue);
 	}
 }
-DECLARE_TASKLET(goldfish_interrupt_tasklet, goldfish_interrupt_task, 0);
 
 /*
  * The general idea of the interrupt handling:
@@ -661,13 +667,13 @@ static irqreturn_t goldfish_pipe_interrupt(int irq, void *dev_id)
 	unsigned long flags;
 	struct goldfish_pipe_dev *dev = dev_id;
 
-	if (dev != &goldfish_pipe_dev)
+	if (dev->super.deinit != &goldfish_pipe_device_deinit)
 		return IRQ_NONE;
 
 	/* Request the signalled pipes from the device */
 	spin_lock_irqsave(&dev->lock, flags);
 
-	count = readl(dev->base + PIPE_REG_GET_SIGNALLED);
+	count = readl(dev->base + PIPE_V2_REG_GET_SIGNALLED);
 	if (count == 0) {
 		spin_unlock_irqrestore(&dev->lock, flags);
 		return IRQ_NONE;
@@ -682,7 +688,7 @@ static irqreturn_t goldfish_pipe_interrupt(int irq, void *dev_id)
 
 	spin_unlock_irqrestore(&dev->lock, flags);
 
-	tasklet_schedule(&goldfish_interrupt_tasklet);
+	tasklet_schedule(&dev->irq_tasklet);
 	return IRQ_HANDLED;
 }
 
@@ -701,8 +707,7 @@ static int get_free_pipe_id_locked(struct goldfish_pipe_dev *dev)
 		 */
 		u32 new_capacity = 2 * dev->pipes_capacity;
 		struct goldfish_pipe **pipes =
-				kcalloc(new_capacity, sizeof(*pipes),
-					GFP_ATOMIC);
+			kcalloc(new_capacity, sizeof(*pipes), GFP_ATOMIC);
 		if (!pipes)
 			return -ENOMEM;
 		memcpy(pipes, dev->pipes, sizeof(*pipes) * dev->pipes_capacity);
@@ -712,6 +717,14 @@ static int get_free_pipe_id_locked(struct goldfish_pipe_dev *dev)
 		dev->pipes_capacity = new_capacity;
 	}
 	return id;
+}
+
+/* A helper function to get the instance of goldfish_pipe_dev from file */
+static struct goldfish_pipe_dev *to_goldfish_pipe_dev(struct file *file)
+{
+	struct miscdevice *miscdev = file->private_data;
+
+	return container_of(miscdev, struct goldfish_pipe_dev, miscdev);
 }
 
 /**
@@ -727,8 +740,7 @@ static int get_free_pipe_id_locked(struct goldfish_pipe_dev *dev)
  */
 static int goldfish_pipe_open(struct inode *inode, struct file *file)
 {
-	struct goldfish_pipe_dev *dev = &goldfish_pipe_dev;
-	struct device *pdev_dev;
+	struct goldfish_pipe_dev *dev = to_goldfish_pipe_dev(file);
 	unsigned long flags;
 	int id;
 	int status;
@@ -736,23 +748,21 @@ static int goldfish_pipe_open(struct inode *inode, struct file *file)
 	/* Allocate new pipe kernel object */
 	struct goldfish_pipe *pipe = kzalloc(sizeof(*pipe), GFP_KERNEL);
 
-	if (pipe == NULL)
+	if (!pipe)
 		return -ENOMEM;
 
 	pipe->dev = dev;
 	mutex_init(&pipe->lock);
 	init_waitqueue_head(&pipe->wake_queue);
 
-	pdev_dev = dev->pdev_dev;
-
 	/*
-	 * Command buffer needs to be allocated on its own page to make sure it
-	 * is physically contiguous in host's address space.
+	 * Command buffer needs to be allocated on its own page to make sure
+	 * it is physically contiguous in host's address space.
 	 */
+	BUILD_BUG_ON(sizeof(struct goldfish_pipe_command) > PAGE_SIZE);
 	pipe->command_buffer =
 		(struct goldfish_pipe_command *)__get_free_page(GFP_KERNEL);
 	if (!pipe->command_buffer) {
-		dev_err(pdev_dev, "Could not alloc pipe command buffer!\n");
 		status = -ENOMEM;
 		goto err_pipe;
 	}
@@ -761,7 +771,6 @@ static int goldfish_pipe_open(struct inode *inode, struct file *file)
 
 	id = get_free_pipe_id_locked(dev);
 	if (id < 0) {
-		dev_err(pdev_dev, "Could not get free pipe id!\n");
 		status = id;
 		goto err_id_locked;
 	}
@@ -774,16 +783,11 @@ static int goldfish_pipe_open(struct inode *inode, struct file *file)
 	dev->buffers->open_command_params.rw_params_max_count =
 			MAX_BUFFERS_PER_COMMAND;
 	dev->buffers->open_command_params.command_buffer_ptr =
-			(u64)__pa(pipe->command_buffer);
+			(u64)(unsigned long)__pa(pipe->command_buffer);
 	status = goldfish_pipe_cmd_locked(pipe, PIPE_CMD_OPEN);
 	spin_unlock_irqrestore(&dev->lock, flags);
-	if (status < 0) {
-		dev_err(pdev_dev,
-			"Could not tell host of new pipe! status=%d\n",
-			status);
+	if (status < 0)
 		goto err_cmd;
-	}
-
 	pipe->dma = NULL;
 
 	/* All is done, save the pipe into the file's private data field */
@@ -812,41 +816,26 @@ static void goldfish_pipe_dma_release_host(struct goldfish_pipe *pipe)
 	pdev_dev = pipe->dev->pdev_dev;
 
 	if (dma->dma_vaddr) {
-		dev_dbg(pdev_dev, "Last ref for dma region @ 0x%llx\n",
-			dma->phys_begin);
-
 		pipe->command_buffer->dma_maphost_params.dma_paddr =
 			dma->phys_begin;
 		pipe->command_buffer->dma_maphost_params.sz = dma->dma_size;
 		goldfish_pipe_cmd(pipe, PIPE_CMD_DMA_HOST_UNMAP);
 	}
-
-	dev_dbg(pdev_dev,
-		"after delete of dma @ 0x%llx: alloc total %zu\n",
-		dma->phys_begin, pipe->dev->dma_alloc_total);
 }
 
 static void goldfish_pipe_dma_release_guest(struct goldfish_pipe *pipe)
 {
 	struct goldfish_dma_context *dma = pipe->dma;
-	struct device *pdev_dev;
 
 	if (!dma)
 		return;
 
-	pdev_dev = pipe->dev->pdev_dev;
-
 	if (dma->dma_vaddr) {
-		dma_free_coherent(
-				dma->pdev_dev,
-				dma->dma_size,
-				dma->dma_vaddr,
-				dma->phys_begin);
+		dma_free_coherent(dma->pdev_dev,
+				  dma->dma_size,
+				  dma->dma_vaddr,
+				  dma->phys_begin);
 		pipe->dev->dma_alloc_total -= dma->dma_size;
-
-		dev_dbg(pdev_dev,
-			"after delete of dma @ 0x%llx: alloc total %zu\n",
-			dma->phys_begin, pipe->dev->dma_alloc_total);
 	}
 }
 
@@ -931,51 +920,30 @@ static bool check_region_size_valid(size_t size)
 static int goldfish_pipe_dma_alloc_locked(struct goldfish_pipe *pipe)
 {
 	struct goldfish_dma_context *dma = pipe->dma;
-	struct device *pdev_dev = pipe->dev->pdev_dev;
 
-	dev_dbg(pdev_dev, "%s: try alloc dma for pipe %p\n",
-			__func__, pipe);
-
-	if (dma->dma_vaddr) {
-		dev_dbg(pdev_dev, "%s: already alloced, return.\n",
-			__func__);
+	if (dma->dma_vaddr)
 		return 0;
-	}
 
 	dma->phys_begin = 0;
-	dma->dma_vaddr =
-		dma_alloc_coherent(
-				dma->pdev_dev,
-				dma->dma_size,
-				&dma->phys_begin,
-				GFP_KERNEL);
+	dma->dma_vaddr = dma_alloc_coherent(dma->pdev_dev,
+					    dma->dma_size,
+					    &dma->phys_begin,
+					    GFP_KERNEL);
 	if (!dma->dma_vaddr)
 		return -ENOMEM;
 
 	dma->phys_end = dma->phys_begin + dma->dma_size;
 	pipe->dev->dma_alloc_total += dma->dma_size;
-
-	dev_dbg(pdev_dev, "%s: got v/p addrs "
-		"%p 0x%llx sz %zu total alloc %zu\n",
-		__func__,
-		dma->dma_vaddr,
-		dma->phys_begin,
-		dma->dma_size,
-		pipe->dev->dma_alloc_total);
 	pipe->command_buffer->dma_maphost_params.dma_paddr = dma->phys_begin;
 	pipe->command_buffer->dma_maphost_params.sz = dma->dma_size;
 
-	/*
-	 * Use this codepath instead once http://aosp/705851 is in stable.
-	 *
-	 * return goldfish_pipe_cmd_locked(pipe, PIPE_CMD_DMA_HOST_MAP);
-	 */
 	goldfish_pipe_cmd_locked(pipe, PIPE_CMD_DMA_HOST_MAP);
+	/* A workaround for b/110152998 */
 	return 0;
 }
 
-static int goldfish_dma_mmap_locked(
-	struct goldfish_pipe *pipe, struct vm_area_struct *vma)
+static int goldfish_dma_mmap_locked(struct goldfish_pipe *pipe,
+				    struct vm_area_struct *vma)
 {
 	struct goldfish_dma_context *dma = pipe->dma;
 	struct device *pdev_dev = pipe->dev->pdev_dev;
@@ -988,37 +956,21 @@ static int goldfish_dma_mmap_locked(
 		return -EINVAL;
 	}
 
-	dev_dbg(pdev_dev, "Mapping dma at 0x%llx\n", dma->phys_begin);
-
 	/* Alloc phys region if not allocated already. */
 	status = goldfish_pipe_dma_alloc_locked(pipe);
-	if (status) {
-		dev_err(pdev_dev,
-			"goldfish_pipe_dma_alloc_locked failed with status=%d, "
-			"dma->phys_begin=%lx "
-			"vma->vm_start=%ld vma->vm_end=%lx\n",
-			status,
-			(unsigned long)dma->phys_begin,
-			vma->vm_start, vma->vm_end);
+	if (status)
 		return status;
-	}
 
-	status =
-		remap_pfn_range(
-				vma,
-				vma->vm_start,
-				dma->phys_begin >> PAGE_SHIFT,
-				sz_requested,
-				vma->vm_page_prot);
+	status = remap_pfn_range(vma,
+				 vma->vm_start,
+				 dma->phys_begin >> PAGE_SHIFT,
+				 sz_requested,
+				 vma->vm_page_prot);
 	if (status < 0) {
 		dev_err(pdev_dev, "Cannot remap pfn range....\n");
 		return -EAGAIN;
 	}
-
 	vma->vm_ops = &goldfish_dma_vm_ops;
-	dev_dbg(pdev_dev, "goldfish_dma_mmap for host vaddr 0x%llx succeeded\n",
-		dma->phys_begin);
-
 	return 0;
 }
 
@@ -1040,8 +992,8 @@ static int goldfish_dma_mmap(struct file *filp, struct vm_area_struct *vma)
 	return status;
 }
 
-static int goldfish_pipe_dma_create_region(
-	struct goldfish_pipe *pipe, size_t size)
+static int goldfish_pipe_dma_create_region(struct goldfish_pipe *pipe,
+					   size_t size)
 {
 	struct goldfish_dma_context *dma =
 		kzalloc(sizeof(struct goldfish_dma_context), GFP_KERNEL);
@@ -1072,7 +1024,7 @@ static int goldfish_pipe_dma_create_region(
 }
 
 static long goldfish_dma_ioctl_getoff(struct goldfish_pipe *pipe,
-	unsigned long arg)
+				      unsigned long arg)
 {
 	struct device *pdev_dev = pipe->dev->pdev_dev;
 	struct goldfish_dma_ioctl_info ioctl_data;
@@ -1096,21 +1048,17 @@ static long goldfish_dma_ioctl_getoff(struct goldfish_pipe *pipe,
 	}
 
 	if (copy_to_user((void __user *)arg, &ioctl_data,
-		sizeof(ioctl_data))) {
+			 sizeof(ioctl_data))) {
 		mutex_unlock(&pipe->lock);
 		return -EFAULT;
 	}
-
-	dev_dbg(pdev_dev,
-		"DMA_IOC_GETOFF: phys_begin=0x%llx size=%lld\n",
-		ioctl_data.phys_begin, ioctl_data.size);
 
 	mutex_unlock(&pipe->lock);
 	return 0;
 }
 
 static long goldfish_dma_ioctl_create_region(struct goldfish_pipe *pipe,
-	unsigned long arg)
+					     unsigned long arg)
 {
 	struct goldfish_dma_ioctl_info ioctl_data;
 
@@ -1127,8 +1075,8 @@ static long goldfish_dma_ioctl_create_region(struct goldfish_pipe *pipe,
 	return goldfish_pipe_dma_create_region(pipe, ioctl_data.size);
 }
 
-static long goldfish_dma_ioctl(
-	struct file *file, unsigned int cmd, unsigned long arg)
+static long goldfish_dma_ioctl(struct file *file, unsigned int cmd,
+			       unsigned long arg)
 {
 	struct goldfish_pipe *pipe =
 		(struct goldfish_pipe *)(file->private_data);
@@ -1160,12 +1108,14 @@ static const struct file_operations goldfish_pipe_fops = {
 	.compat_ioctl = goldfish_dma_ioctl,
 };
 
-static struct miscdevice goldfish_pipe_miscdev = {
-	.minor = MISC_DYNAMIC_MINOR,
-	.name = "goldfish_pipe",
-	.fops = &goldfish_pipe_fops,
-};
+static void init_miscdevice(struct miscdevice *miscdev)
+{
+	memset(miscdev, 0, sizeof(*miscdev));
 
+	miscdev->minor = MISC_DYNAMIC_MINOR;
+	miscdev->name = DEVICE_NAME;
+	miscdev->fops = &goldfish_pipe_fops;
+}
 
 static void write_pa_addr(void *addr, void __iomem *portl, void __iomem *porth)
 {
@@ -1175,33 +1125,48 @@ static void write_pa_addr(void *addr, void __iomem *portl, void __iomem *porth)
 	writel(lower_32_bits(paddr), portl);
 }
 
-static int goldfish_pipe_device_init_v2(struct platform_device *pdev)
+int goldfish_pipe_device_v2_init(struct platform_device *pdev,
+				 char __iomem *base,
+				 int irq)
 {
-	struct goldfish_pipe_dev *dev = &goldfish_pipe_dev;
-	struct device *pdev_dev = &pdev->dev;
-	char *page;
+	struct goldfish_pipe_dev *dev;
 	int err;
 
-	err = devm_request_irq(pdev_dev, dev->irq, goldfish_pipe_interrupt,
-				IRQF_SHARED, "goldfish_pipe", dev);
+	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+	if (!dev)
+		return -ENOMEM;
+
+	dev->super.deinit = &goldfish_pipe_device_deinit;
+	spin_lock_init(&dev->lock);
+
+	tasklet_init(&dev->irq_tasklet, &goldfish_interrupt_task,
+		     (unsigned long)dev);
+
+	err = devm_request_irq(&pdev->dev, irq,
+			       goldfish_pipe_interrupt,
+			       IRQF_SHARED, DEVICE_NAME, dev);
 	if (err) {
-		dev_err(pdev_dev, "unable to allocate IRQ for v2\n");
+		dev_err(&pdev->dev, "unable to allocate IRQ for v2\n");
 		return err;
 	}
 
-	err = misc_register(&goldfish_pipe_miscdev);
+	init_miscdevice(&dev->miscdev);
+	err = misc_register(&dev->miscdev);
 	if (err) {
-		dev_err(pdev_dev, "unable to register v2 device\n");
+		dev_err(&pdev->dev, "unable to register v2 device\n");
 		return err;
 	}
 
-	dev->pdev_dev = pdev_dev;
+	dev->base = base;
+	dev->pdev_dev = &pdev->dev;
 	dev->first_signalled_pipe = NULL;
 	dev->pipes_capacity = INITIAL_PIPES_CAPACITY;
 	dev->pipes = kcalloc(dev->pipes_capacity, sizeof(*dev->pipes),
-		GFP_KERNEL);
-	if (!dev->pipes)
+			     GFP_KERNEL);
+	if (!dev->pipes) {
+		misc_deregister(&dev->miscdev);
 		return -ENOMEM;
+	}
 
 	/*
 	 * We're going to pass two buffers, open_command_params and
@@ -1209,126 +1174,40 @@ static int goldfish_pipe_device_init_v2(struct platform_device *pdev)
 	 * needs to be contained in a single physical page. The easiest choice
 	 * is to just allocate a page and place the buffers in it.
 	 */
-	BUILD_BUG_ON(sizeof(*dev->buffers) > PAGE_SIZE);
-	page = (char *)__get_free_page(GFP_KERNEL);
-	if (!page) {
+	BUILD_BUG_ON(sizeof(struct goldfish_pipe_dev_buffers) > PAGE_SIZE);
+	dev->buffers = (struct goldfish_pipe_dev_buffers *)
+		__get_free_page(GFP_KERNEL);
+	if (!dev->buffers) {
 		kfree(dev->pipes);
+		misc_deregister(&dev->miscdev);
 		return -ENOMEM;
 	}
-	dev->buffers = (struct goldfish_pipe_dev_buffers *)page;
 
 	/* Send the buffer addresses to the host */
 	write_pa_addr(&dev->buffers->signalled_pipe_buffers,
-		dev->base + PIPE_REG_SIGNAL_BUFFER,
-		dev->base + PIPE_REG_SIGNAL_BUFFER_HIGH);
+		      dev->base + PIPE_V2_REG_SIGNAL_BUFFER,
+		      dev->base + PIPE_V2_REG_SIGNAL_BUFFER_HIGH);
 
-	writel((u32)MAX_SIGNALLED_PIPES,
-		dev->base + PIPE_REG_SIGNAL_BUFFER_COUNT);
+	writel(MAX_SIGNALLED_PIPES,
+	       dev->base + PIPE_V2_REG_SIGNAL_BUFFER_COUNT);
 
 	write_pa_addr(&dev->buffers->open_command_params,
-		dev->base + PIPE_REG_OPEN_BUFFER,
-		dev->base + PIPE_REG_OPEN_BUFFER_HIGH);
+		      dev->base + PIPE_V2_REG_OPEN_BUFFER,
+		      dev->base + PIPE_V2_REG_OPEN_BUFFER_HIGH);
 
+	platform_set_drvdata(pdev, dev);
 	return 0;
 }
 
-static void goldfish_pipe_device_deinit_v2(struct platform_device *pdev)
+static int goldfish_pipe_device_deinit(void *raw_dev,
+				       struct platform_device *pdev)
 {
-	misc_deregister(&goldfish_pipe_miscdev);
-	kfree(goldfish_pipe_dev.pipes);
-	free_page((unsigned long)goldfish_pipe_dev.buffers);
-}
+	struct goldfish_pipe_dev *dev = raw_dev;
 
-static int goldfish_pipe_probe(struct platform_device *pdev)
-{
-	int err;
-	struct resource *r;
-	struct goldfish_pipe_dev *dev = &goldfish_pipe_dev;
-	struct device *pdev_dev = &pdev->dev;
+	misc_deregister(&dev->miscdev);
+	tasklet_kill(&dev->irq_tasklet);
+	kfree(dev->pipes);
+	free_page((unsigned long)dev->buffers);
 
-	BUILD_BUG_ON(sizeof(struct goldfish_pipe_command) > PAGE_SIZE);
-
-	/* not thread safe, but this should not happen */
-	WARN_ON(dev->base != NULL);
-
-	spin_lock_init(&dev->lock);
-
-	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (r == NULL || resource_size(r) < PAGE_SIZE) {
-		dev_err(pdev_dev, "can't allocate i/o page\n");
-		return -EINVAL;
-	}
-	dev->base = devm_ioremap(pdev_dev, r->start, PAGE_SIZE);
-	if (dev->base == NULL) {
-		dev_err(pdev_dev, "ioremap failed\n");
-		return -EINVAL;
-	}
-
-	r = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
-	if (r == NULL) {
-		err = -EINVAL;
-		goto error;
-	}
-	dev->irq = r->start;
-
-	/*
-	 * Exchange the versions with the host device
-	 *
-	 * Note: v1 driver used to not report its version, so we write it before
-	 *  reading device version back: this allows the host implementation to
-	 *  detect the old driver (if there was no version write before read).
-	 */
-	writel((u32)PIPE_DRIVER_VERSION, dev->base + PIPE_REG_VERSION);
-	dev->version = readl(dev->base + PIPE_REG_VERSION);
-	if (dev->version < PIPE_CURRENT_DEVICE_VERSION) {
-		/* initialize the old device version */
-		err = goldfish_pipe_device_init_v1(pdev);
-	} else {
-		/* Host device supports the new interface */
-		err = goldfish_pipe_device_init_v2(pdev);
-	}
-	if (!err)
-		return 0;
-
-error:
-	dev->base = NULL;
-	return err;
-}
-
-static int goldfish_pipe_remove(struct platform_device *pdev)
-{
-	struct goldfish_pipe_dev *dev = &goldfish_pipe_dev;
-
-	if (dev->version < PIPE_CURRENT_DEVICE_VERSION)
-		goldfish_pipe_device_deinit_v1(pdev);
-	else
-		goldfish_pipe_device_deinit_v2(pdev);
-	dev->base = NULL;
 	return 0;
 }
-
-static const struct acpi_device_id goldfish_pipe_acpi_match[] = {
-	{ "GFSH0003", 0 },
-	{ },
-};
-MODULE_DEVICE_TABLE(acpi, goldfish_pipe_acpi_match);
-
-static const struct of_device_id goldfish_pipe_of_match[] = {
-	{ .compatible = "google,android-pipe", },
-	{},
-};
-MODULE_DEVICE_TABLE(of, goldfish_pipe_of_match);
-
-static struct platform_driver goldfish_pipe_driver = {
-	.probe = goldfish_pipe_probe,
-	.remove = goldfish_pipe_remove,
-	.driver = {
-		.name = "goldfish_pipe",
-		.of_match_table = goldfish_pipe_of_match,
-		.acpi_match_table = ACPI_PTR(goldfish_pipe_acpi_match),
-	}
-};
-
-module_platform_driver(goldfish_pipe_driver);
-MODULE_AUTHOR("David Turner <digit@google.com>");
-MODULE_LICENSE("GPL v2");

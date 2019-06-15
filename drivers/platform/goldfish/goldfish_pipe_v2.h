@@ -13,14 +13,12 @@
  *
  */
 
-#ifndef GOLDFISH_PIPE_H
-#define GOLDFISH_PIPE_H
+#ifndef GOLDFISH_PIPE_V2_H
+#define GOLDFISH_PIPE_V2_H
 
-#define DEVICE_NAME "goldfish_pipe"
+/* The entry point to the pipe v2 driver */
+int goldfish_pipe_device_v2_init(struct platform_device *pdev,
+				 char __iomem *base,
+				 int irq);
 
-struct goldfish_pipe_dev_base {
-	/* the destructor, the pointer is set in init */
-	int (*deinit)(void *pipe_dev, struct platform_device *pdev);
-};
-
-#endif /* GOLDFISH_PIPE_H */
+#endif /* #define GOLDFISH_PIPE_V2_H */
