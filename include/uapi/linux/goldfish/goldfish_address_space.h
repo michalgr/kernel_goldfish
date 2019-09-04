@@ -17,8 +17,8 @@ struct goldfish_address_space_ping {
 	__u64 size;
 	__u64 metadata;
 	__u64 wait_offset;
-    __u32 wait_flags;
-    __u32 direction;
+	__u32 wait_flags;
+	__u32 direction;
 };
 
 #define GOLDFISH_ADDRESS_SPACE_IOCTL_MAGIC	'G'
@@ -35,6 +35,6 @@ struct goldfish_address_space_ping {
 
 #define GOLDFISH_ADDRESS_SPACE_IOCTL_PING \
 	GOLDFISH_ADDRESS_SPACE_IOCTL_OP(12, \
-        struct goldfish_address_space_ping)
+		struct goldfish_address_space_ping)
 
 #endif /* UAPI_GOLDFISH_ADDRESS_SPACE_H */
